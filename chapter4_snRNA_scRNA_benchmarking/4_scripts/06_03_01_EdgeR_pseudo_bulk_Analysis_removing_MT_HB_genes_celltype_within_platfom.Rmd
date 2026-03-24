@@ -1,0 +1,667 @@
+---
+title: "06_03_01_EdgeR_pseudo_bulk_Analysis_removing_MT_HB_genes_celltype_within_platfom"
+author: "Reza Ghamsari"
+date: "2025-05-11"
+output: html_document
+---
+## Script Overview
+This script performs pseudo-bulk differential expression analysis comparing different cell types within each methodology using EdgeR.. 
+Then we compared these DEs between two methodologies.
+**Key analyses:**
+- CD4 vs CD8 T cells
+- CD16 vs CD14 Monocytes  
+- Erythroblasts vs B cells
+
+
+```{r setup, include=FALSE}
+all_times <- list()  # store the time for each chunk
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now)
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  time_it = TRUE
+)
+```
+
+
+# Define Color Schemes and File Paths
+```{r, colors}
+# Custom color palette for consistent visualization
+my_colors <- unique(c(
+  "#802268FF", "#006400", "#525ecc99", "#1f0fdf99", "#480607", "#D55E00", 
+  "#164194FF", "#7E6148FF", "#ADB6B6FF", "#52a7cc99", "#F0E685FF", "#cc52c099", 
+  "#6acc5299", "#DC143C", "#802268FF", "#ffbb78", "#3C548899", "#189b3699", 
+  "#cc9b5299", "#1f0fdf99", "#ccebc5", "#42857599", "#868686FF", "#006400", 
+  "#0A47FFFF", "#3B1B53FF", "#749B58FF", "#ccc05299", "#cc765299", "#1B1919FF", 
+  "#00D68FFF", "#14FFB1FF", "#3C5488FF", "#8F7700FF", "#164194FF", "#0094CDFF", 
+  "#FFDAB9", "#FF00FF", "#00FFFF", "green", "blue", "#480607"
+))
+
+
+# Define the directory to save the PDF files
+rds_path_vst <- "/vast/projects/aml_multiome/Sn_vs_SC/rds_path_vst/"
+fig_path_stnx <- "/home/users/allstaff/ghamsari.r/seurat_figures/Sn_vs_SC_V4/"
+```
+
+
+# Loading Packages
+```{r, pkgs}
+script_title <- "06_03_01_EdgeR_pseudo_bulk_Analysis_removing_MT_HB_genes_celltype_within_platfom"
+pkgs <- c("Signac", "Seurat", "BiocParallel", "DESeq2", "gridExtra", "parallel", "edgeR", "RColorBrewer", "patchwork", 
+"limma", "tibble", "openxlsx", "ggplot2", "reshape2", "dplyr", "grid", "tidyverse", "htmlwidgets", "cowplot", "stringr", 
+"tidyr", "pheatmap", "ggrepel", "VennDiagram", "clusterProfiler", "enrichplot" , "msigdbr", "UpSetR", "org.Hs.eg.db")
+
+# Load all packages silently
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# Save session information for reproducibility
+sink(file.path(fig_path_stnx, paste0(script_title, "_sessionInfo.txt")))
+sessionInfo()
+sink()
+```
+
+
+
+
+#Reading data
+```{r, reading objects}
+merged_obj <- readRDS(paste0(rds_path_vst, "05_Merge_object_cell_types_annotated_clustered_list_22_samples_11sn_11sc.rds"))
+
+
+
+all_genes_name <- rownames(merged_obj@assays$RNA)
+removing_genes_patterns <- "^IGHV|^IGKV|^IGLV|^TRAV|^TRBV|^TRDV|^TRGV|^HB[^(P)]|MALAT1|^RP[SL]|^IG[HKL][A-Z0-9-]*|^MT-"
+removing_genes <- grep(removing_genes_patterns, all_genes_name, value = TRUE)
+residual_genes <- all_genes_name[!all_genes_name %in% removing_genes]
+merged_obj <- subset(merged_obj, features = residual_genes) #34920 features across 172055 samples within 1 assay
+```
+
+
+# EdgeR pseudo-bulk analysis function and execution
+
+```{r}
+# Define cell type pairs for comparison
+pair_cells_list <- list(CD4vsCD8_T_cells = c("CD4_T_cells", "CD8_T_cells"), CD16vsCD14_Monocyte= c("CD16_Monocyte", "CD14_Monocyte"), Erythro_vsB_cells = c("Erythroblast", "B_Cells"))
+
+DEG_EdgeR_fun <- function(         # Name of the cell type to analyze
+  pre_PB,              # Seurat object
+  min_cell_in_group=50, # Minimum number of cells required per group
+result_name=result_name
+) {
+result_name
+
+  # Define grouping level and create new metadata columns
+  pre_PB@meta.data$cell_type_fine_donor <- paste0(pre_PB@meta.data$cell_type_fine, "_", pre_PB@meta.data$sample_id)
+# print(unique( pre_PB@meta.data$cell_type_fine_donor ))
+  # Step 1: Calculate cell counts per group
+  group_cell_num <- table(pre_PB@meta.data[["cell_type_fine_donor"]])
+  cell_counts_df <- as.data.frame(group_cell_num)
+  colnames(cell_counts_df) <- c("cell_type_fine_donor", "group_cell_counts")
+  # Merge cell counts back to metadata
+  merged_metadata <- dplyr::left_join(pre_PB@meta.data, cell_counts_df, by = "cell_type_fine_donor")
+  pre_PB@meta.data$group_cell_count <- merged_metadata$group_cell_counts
+ table(unique(pre_PB@meta.data$group_cell_count) >min_cell_in_group)
+
+check_result <- unique(pre_PB@meta.data$group_cell_count) > min_cell_in_group
+
+ # Check if all groups have insufficient cells
+if (all(!check_result)) {
+    print(paste0("Skipping cluster ", result_name, ": low number of cells in all groups"))
+    return(NULL)  # Return NULL to skip this cluster in the analysis
+ }
+
+  # print(length(unique(pre_PB@meta.data[["cell_type_fine_donor"]])))
+
+  
+  # Step 2: Filter for groups with >=50 cells
+  pre_PB <- subset(pre_PB, subset = group_cell_count >= min_cell_in_group)
+
+   message(paste0("Number of cells after filtering based on minimum cell count: ", length(colnames(pre_PB))))
+  
+  # Check if there are enough groups for comparison
+  if (length(unique(pre_PB@meta.data[["cell_type_fine_donor"]])) < 3) {
+    message(paste0("Skipping cluster ", result_name, ": fewer than 3 groups after filtering"))
+    return(NULL)
+  }
+
+
+
+# Check if we have enough donors per cell_type_fine for a meaningful comparison
+  donor_counts <- aggregate(pre_PB$cell_type_fine_donor, 
+                           by = list(pre_PB$cell_type_fine), 
+                           FUN = function(x) length(unique(x)))
+  colnames(donor_counts) <- c("cell_type_fine", "unique_donors")
+
+# Identify conditions with at least two unique donors
+valid_conditions <- donor_counts$cell_type_fine[donor_counts$unique_donors >= 2]
+
+if (length(valid_conditions) < 2) {
+    message(paste0("Skipping cluster ", result_name, ": fewer than 2 conditions with multiple donors"))
+    return(NULL)
+  }
+  
+##########################################
+##########################################  # ======= EdgeR Analysis =======
+##########################################
+
+# Aggregatecell_type_fine_donor# Aggregate expression data for RNA
+DefaultAssay(pre_PB) <- "RNA"
+y <- Seurat2PB(pre_PB, sample="sample_id", cluster="cell_type_fine")
+# List of columns to copy
+columns_to_copy <- c( "sample_id", "Platform", "Site", "Donor")
+
+# Loop through each column name
+for (column_name in columns_to_copy) {
+   # Initialize the new column with NA
+  y$samples[[column_name]] <- NA
+  
+  #  Match donors and copy data
+  y$samples[[column_name]] <- pre_PB@meta.data[[column_name]][match(y$samples$sample, pre_PB@meta.data$sample_id)]
+}
+
+ # Filter out samples with low library size
+  keep.samples <- y$samples$lib.size > 1e4
+  if (sum(keep.samples) < 3) {
+    message(paste0("Skipping cluster ", result_name, ": fewer than 3 samples after library size filtering"))
+    return(NULL)
+  }
+  y <- y[, keep.samples]
+  
+ y <- y[rowSums(y$counts >10) >= 4 &rowSums(y$counts) >50, ]
+ if (nrow(y) < 100) {
+    message(paste0("Skipping cluster ", result_name, ": fewer than 100 genes after filtering"))
+    return(NULL)
+  }
+
+ y <- edgeR::normLibSizes(y, method = "TMM")
+ # summary(y$samples$norm.factors)
+ 
+
+  # Create sample info data frame for visualization
+  sample_info <- data.frame(
+    sample_id = y$samples$sample_id,
+    libsize = y$samples$lib.size,
+    cell_type_fine = y$samples$cluster,
+    Donor = y$samples$Donor,
+    Site = y$samples$Site
+  )
+  
+  # Add all copied columns to sample_info
+  for (column_name in columns_to_copy) {
+    sample_info[[column_name]] <- as.factor(y$samples[[column_name]])
+  }
+  
+  # Generate MDS plot
+mds_plot <- Glimma::glimmaMDS(
+    y,
+    groups = sample_info
+)
+
+
+# Save the plot as HTML
+htmlwidgets::saveWidget(mds_plot, paste0(fig_path_stnx, "MDS_EdgeR/06_03_01_EdgeR_MDS_", result_name, ".html"))
+
+
+######################################################################################
+################################################# ======= Statistical Modeling =======
+######################################################################################
+Donor <- factor(y$samples$Donor)
+cell_type_fine <- factor(y$samples$cluster)
+Site <- factor(y$samples$Site)
+Sample_id <- factor(y$samples$sample_id)
+Donor_site <- factor(paste0(Donor,"-" , Site )) 
+
+# Define coefficient for testing
+coef <- as.character(unique(cell_type_fine)[2])
+print(paste0("positive lfc in: ", coef))
+ # Create design matrix: cell type + donor-site effects
+design <- model.matrix(~cell_type_fine  +Donor_site)
+
+ # Clean up column names
+colnames(design) <- gsub("cell_type_fine|Donor|Donor_site", "", colnames(design))
+colnames(design) <- make.names(colnames(design))
+colnames(design)[1] <- "Int"
+
+ # Estimate dispersion and fit model
+bulk_RNA <- edgeR::estimateDisp(y, design, robust=TRUE)
+ # Fit the model
+    fit <- edgeR::glmQLFit(bulk_RNA, design, robust=TRUE)
+    # Test for differential expression
+    qlf <- edgeR::glmQLFTest(fit, coef = coef)
+# This means: comparing snRNA to scRNA (which is the reference group in the design).
+# logFC = log2(mean_expression_in_snRNA / mean_expression_in_scRNA) so when Gene is upregulated in snRNA compared to scRNA >>> LFC is Positive
+
+ # Extract results
+    result <- edgeR::topTags(qlf, n = Inf)$table
+    result$positive_lfc <- coef
+    result$negative_lfc <- as.character(unique(cell_type_fine)[1])
+  # Create results structure
+    results <- list(
+      DEG_table = result,
+      design = design,
+      dispersion = bulk_RNA$common.dispersion,
+      BCV = sqrt(bulk_RNA$common.dispersion),
+      sample_info = sample_info
+    )
+    return(results)}
+
+######==================================== Run differential expression analysis for all cell types
+results_list <- list()
+
+for(group_name in unique(merged_obj$Platform)){
+    cells_in_group <- merged_obj@meta.data$Platform == group_name
+
+    sobject_1 <- subset(
+  merged_obj,
+  Platform == group_name
+)
+print(paste0(group_name, " started"))
+    for( celltype in names(pair_cells_list)){
+      paired_cells <- pair_cells_list[[celltype]]
+      print(celltype)
+      sobject <- subset(
+  sobject_1,
+  cell_type_fine %in% paired_cells
+)
+ sobject$cell_type_fine <- droplevels(sobject$cell_type_fine)
+ print(paste0(celltype, " started"))     
+ 
+result_name <- paste0(group_name,"_" ,celltype)
+results_list[[result_name]] <- DEG_EdgeR_fun(pre_PB =sobject, min_cell_in_group = 50, result_name= result_name )
+ print(paste0(result_name, " finished")) 
+}
+}
+# Save results
+saveRDS(results_list, paste0(rds_path_vst, "06_03_01_EdgeR_RNA_results_cell_type_fine.rds"))
+
+```
+
+# Results Processing and Export
+
+```{r}
+results_list <- readRDS(paste0(rds_path_vst, "06_03_01_EdgeR_RNA_results_cell_type_fine.rds"))
+DEG_final_list <- list()
+
+for (group in names(results_list)) {
+  tbl <- results_list[[group]]$DEG_table
+  tbl <- as.data.frame(tbl)
+  
+  tbl$Gene_name <- rownames(tbl)  # ✅ Add gene names before dplyr::mutate
+
+  tbl <- tbl %>%
+    dplyr::arrange(FDR)  # ✅ Rank genes by increasing FDR
+
+  DEG_final_list[[group]] <- tbl
+}
+
+saveRDS(DEG_final_list, paste0(rds_path_vst, "06_03_01_EdgeR_DEG_celltype_fine.rds"))
+
+
+```
+## Volcano Plot Visualization
+Create volcano plots showing differential expression patterns
+
+```{r}
+DEG_final_list <- readRDS(paste0(rds_path_vst, "06_03_01_EdgeR_DEG_celltype_fine.rds"))
+create_volcano_plots <- function(results_tbls, 
+                                 padj = "FDR", 
+                                 log2FoldChange = "logFC", 
+                                 title_txt = "celltype_fine", 
+                                 gene_to_highlight = NULL,
+                                 lfc_cutoff = 1, 
+                                 fdr_cutoff = 0.05,
+                                 top_gene_number= 5) {
+  
+  volcano_list <- list()
+  
+  for (group in names(results_tbls)) {
+    res_tbl <- results_tbls[[group]]
+    positive_lfc <- res_tbl$positive_lfc
+    res_tbl$gene_name <- rownames(res_tbl)
+    
+    res_tbl$significant <- res_tbl[[padj]] < fdr_cutoff & abs(res_tbl[[log2FoldChange]]) > lfc_cutoff
+    up_gene <- res_tbl$gene_name[res_tbl[[padj]] < fdr_cutoff &res_tbl[[log2FoldChange]]> lfc_cutoff ]
+    down_gene <- res_tbl$gene_name[res_tbl[[padj]] < fdr_cutoff & res_tbl[[log2FoldChange]] < -(lfc_cutoff) ]
+    res_tbl$gene_to_highlight <- if (!is.null(gene_to_highlight)) {
+      res_tbl$gene_name %in% gene_to_highlight
+    } else {
+      res_tbl$gene_name %in%  c(head(up_gene , top_gene_number),head(down_gene , top_gene_number))
+      
+       # res_tbl$gene_name %in%  head(res_tbl$Gene_name , top_gene_number)
+    }
+    
+    res_tbl$label <- ifelse(res_tbl$gene_to_highlight & res_tbl$significant,
+                            res_tbl$gene_name, NA)
+    
+    res_tbl <- res_tbl %>%
+      filter(!is.na(.data[[log2FoldChange]]) & !is.na(.data[[padj]]))
+    
+    res_tbl[[log2FoldChange]] <- as.numeric(res_tbl[[log2FoldChange]])
+    res_tbl[[padj]] <- as.numeric(res_tbl[[padj]])
+    
+    # Plot
+    p <- ggplot(res_tbl, aes(x = .data[[log2FoldChange]],
+                             y = -log10(pmax(.data[[padj]], 1e-300)),
+                             color = significant)) +
+      
+      # Threshold lines 
+      geom_vline(xintercept = c(-lfc_cutoff, lfc_cutoff), linetype = "dashed", size = 0.3, color = "gray30") +
+      geom_hline(yintercept = -log10(fdr_cutoff), linetype = "dashed", size = 0.3, color = "gray30") +
+      
+      # Points
+      geom_point(alpha = 0.6, size = 0.6) +
+      # Labels
+      geom_text_repel(
+        aes(label = label),size = 3.5, max.overlaps = Inf, box.padding = 0.3, show.legend = FALSE,
+  color = "black",            # <-- Label text color
+  segment.color = "gray40",   # <-- Line connecting point to label
+  segment.size = 0.3,
+  segment.alpha = 0.8
+) +
+      
+      scale_color_manual(values = c("FALSE" = "#CC6677", "TRUE" = "#6699CC"),
+                         labels = c("abs(lfc) < 1 | FDR > 0.05", "abs(lfc) > 1 & FDR < 0.05"),
+                         name = "Significance",
+                          guide = guide_legend(override.aes = list(size = 3))) +
+      labs(title = paste0(title_txt, ": ", group, "\n lfc_positive in:", positive_lfc),
+           x = "Log2 Fold Change",
+           y = "-log10(FDR)") +
+      
+      theme_minimal() +
+      theme(
+        axis.text = element_text(size = 10),
+        axis.title = element_text(size = 12, face = "bold"),
+        plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+        legend.position = "right",
+        panel.grid = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA, size = 1)
+      )
+    
+    volcano_list[[group]] <- p
+  }
+  
+  return(volcano_list)
+}
+
+Volcano_plots_DEGs_cell_type <- create_volcano_plots(
+  results_tbls = DEG_final_list,
+  padj = "FDR",
+  log2FoldChange = "logFC",
+  title_txt = "Top 5 DEGs in cell type",
+  gene_to_highlight = NULL,  # Optional
+  lfc_cutoff = 1,
+  fdr_cutoff = 0.05,
+  top_gene_number =5
+)
+
+
+# Save all plots combined into a single PDF page
+pdf(paste0(fig_path_stnx, "06_03_01_volcano_plots_EdgeR_results_final_cell_type_DEGs_per_cell_type_labeled_all_de_genes_final.pdf"), width = 20, height = 8)
+plot_grid(plotlist = Volcano_plots_DEGs_cell_type, ncol = 3)
+dev.off()
+```
+## Overlap Analysis: Venn Diagrams
+Compare DEG overlap between platforms for each cell type comparison.
+
+```{r}
+DEG_final_list <- readRDS(paste0(rds_path_vst, "06_03_01_EdgeR_DEG_celltype_fine.rds"))
+overlap_list <- list()
+
+for (group in names(DEG_final_list)) {
+  res_tbl <- DEG_final_list[[group]]
+  
+  # Subset significantly upregulated and downregulated genes
+  DEG_tbl <- subset(res_tbl, FDR < 0.05 & abs(logFC) > 0)
+  DEG_list <- DEG_tbl$Gene_name
+
+    print(paste0("length DEGs_", group,":  ", length(DEG_list)))
+  
+  # Store in list
+  overlap_list[[paste0("DEGs_", group)]] <- DEG_list
+}
+# names(overlap_list)
+# DE_sets <- overlap_list
+# Generate Venn diagrams for each cell type comparison
+##=========================== CD4 vs CD8 T cells
+pdf_file <- paste0(fig_path_stnx, "06_03_01_venn_CD4vsCD8_T_cells.pdf")
+pdf(pdf_file, width = 9, height = 9) 
+draw.pairwise.venn(
+  area1 = length(overlap_list$DEGs_scRNA_CD4vsCD8_T_cells),
+  area2 = length(overlap_list$DEGs_snRNA_CD4vsCD8_T_cells),
+  cross.area = length(intersect(overlap_list$DEGs_scRNA_CD4vsCD8_T_cells,
+                                 overlap_list$DEGs_snRNA_CD4vsCD8_T_cells)),
+  category = c("scRNA", "snRNA"),
+  fill = c("#6699CC", "#CC6677"),
+  cex = 2.1,
+  cat.cex = 1,
+  lwd = 2
+)
+# Add title using grid graphics
+grid.text("DEGs: CD4vsCD8_T_cells, abs(lfc)>0", 
+          x = 0.5, y = 0.95, gp = gpar(fontsize = 14, fontface = "bold"))
+dev.off()
+
+##=========================== CD16 vs CD14 Monocytes
+pdf_file <- paste0(fig_path_stnx, "06_03_01_venn_CD16vsCD14_Monocyte.pdf")
+pdf(pdf_file, width = 9, height = 9) 
+draw.pairwise.venn(
+  area1 = length(overlap_list$DEGs_scRNA_CD16vsCD14_Monocyte),
+  area2 = length(overlap_list$DEGs_snRNA_CD16vsCD14_Monocyte),
+  cross.area = length(intersect(overlap_list$DEGs_scRNA_CD16vsCD14_Monocyte,
+                                 overlap_list$DEGs_snRNA_CD16vsCD14_Monocyte)),
+  category = c("scRNA", "snRNA"),
+  fill = c("#6699CC", "#CC6677"),
+  cex = 2.1,
+  cat.cex = 1,
+  lwd = 2
+)
+# Add title using grid graphics
+grid.text("DEGs: CD16vsCD14_Monocyte, abs(lfc)>0", 
+          x = 0.5, y = 0.95, gp = gpar(fontsize = 14, fontface = "bold"))
+dev.off()
+##=========================== Erythroblasts vs B cells
+pdf_file <- paste0(fig_path_stnx, "06_03_01_venn_Erythro_vsB_cells.pdf")
+pdf(pdf_file, width = 9, height = 9) 
+draw.pairwise.venn(
+  area1 = length(overlap_list$DEGs_scRNA_Erythro_vsB_cells),
+  area2 = length(overlap_list$DEGs_snRNA_Erythro_vsB_cells),
+  cross.area = length(intersect(overlap_list$DEGs_scRNA_Erythro_vsB_cells,
+                                 overlap_list$DEGs_snRNA_Erythro_vsB_cells)),
+  category = c("scRNA", "snRNA"),
+  fill = c("#6699CC", "#CC6677"),
+  cex = 2.1,
+  cat.cex = 1,
+  lwd = 2
+)
+# Add title using grid graphics
+grid.text("DEGs: Erythro_vsB_cells, abs(lfc)>0", 
+          x = 0.5, y = 0.95, gp = gpar(fontsize = 14, fontface = "bold"))
+dev.off()
+```
+
+# Gene Set Enrichment Analysis using MSigDB
+```{r, fig.width=20}
+#Human Molecular Signatures Database (MSigDB) 
+# Focus on CD4 vs CD8 T cell comparison
+pair_test <- c("scRNA_CD4vsCD8_T_cells", "snRNA_CD4vsCD8_T_cells")
+DEG_final_list <- readRDS(paste0(rds_path_vst, "06_03_01_EdgeR_DEG_celltype_fine.rds"))
+gse_list <- list()
+for (test in pair_test ){
+res_tbl <- DEG_final_list[[test]]
+
+# Create ranked gene list for GSEA
+ranked_genes <- sort(setNames(res_tbl$logFC, res_tbl$Gene_name), decreasing = TRUE)
+
+# Get immunologic signatures from MSigDB
+msig_c7 <- msigdbr(species = "Homo sapiens", category = "C7") #C7: immunologic signature gene sets
+gsea_c7 <- GSEA(ranked_genes, TERM2GENE = msig_c7[, c("gs_name", "gene_symbol")])
+gse_list[[test]] <- gsea_c7}
+
+# Compare top enriched pathways between platforms
+top_sc <- gse_list[["scRNA_CD4vsCD8_T_cells"]]@result %>%
+  dplyr::filter(p.adjust < 0.05) %>%
+  dplyr::top_n(4, wt = abs(NES)) %>% #NES stands for Normalized Enrichment Score.
+  dplyr::select(ID, NES, Description) %>%
+  mutate(type = "scRNA")
+
+top_sn <- gse_list[["snRNA_CD4vsCD8_T_cells"]]@result %>%
+  dplyr::filter(p.adjust < 0.05) %>%
+  dplyr::top_n(4, wt = abs(NES)) %>%
+  dplyr::select(ID, NES, Description) %>%
+  mutate(type = "snRNA")
+
+# Check overlap in top pathways
+overlap_pathways <- length(intersect(top_sc$Description, top_sn$Description))
+cat("Overlapping pathways in top 4:", overlap_pathways, "\n")
+# Combine results for visualization
+top_combined <- bind_rows(top_sc, top_sn)
+
+# Create comparison plot
+pdf_file <- paste0(fig_path_stnx, "06_03_01_GSE_CD4vsCD8_T_cells.pdf")
+pdf(pdf_file, width = 9, height = 4) 
+# Plot
+
+ggplot(top_combined, aes(x = reorder(Description, NES), y = NES, fill = type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  labs(title = "Top Four GSEA NES (scRNA vs snRNA)", x = "Gene Set", y = "NES") +
+  theme_minimal()+
+  scale_fill_manual(values = c("scRNA" = "#6699CC",  # blue
+                               "snRNA" = "#CC6677"))  # 
+dev.off()
+cat("GSEA analysis completed\n")
+```
+
+
+# Directional Overlap Analysis
+Analyze directional overlap of DEGs (up/down-regulated)
+upset plot and VennDiagram  
+```{r}
+DEG_final_list <- readRDS(paste0(rds_path_vst, "06_03_01_EdgeR_DEG_celltype_fine.rds"))
+overlap_list <- list()
+
+for (group in names(DEG_final_list)) {
+  res_tbl <- DEG_final_list[[group]]
+  
+  # Subset significantly upregulated and downregulated genes
+  res_up <- subset(res_tbl, FDR < 0.05 & logFC > 0)
+  res_down <- subset(res_tbl, FDR < 0.05 & logFC < 0)
+  
+  # Get top  gene names from each
+  top_genes_up <- head(res_up$Gene_name, length(res_up$Gene_name))
+  top_genes_down <- head(res_down$Gene_name,  length(res_down$Gene_name))
+  # top_genes_up <- head(res_up$Gene_name, 50)
+  #   top_genes_down <- head(res_down$Gene_name, 50)
+
+  # Store in list
+  overlap_list[[paste0("UP_", group)]] <- top_genes_up
+  overlap_list[[paste0("DOWN_", group)]] <- top_genes_down
+}
+
+############################### Create UpSet plot for overall comparison
+DE_sets <- overlap_list
+
+# Create a data frame with all unique genes across comparisons
+all_genes <- unique(unlist(DE_sets))
+length(all_genes)
+# Convert list into a binary presence-absence matrix
+gene_matrix <- as.data.frame(matrix(0, nrow = length(all_genes), ncol = length(DE_sets)))
+colnames(gene_matrix) <- names(DE_sets)
+rownames(gene_matrix) <- all_genes
+
+# Populate the matrix with 1s where a gene is found in a comparison
+for (comparison in names(DE_sets)) {
+  gene_matrix[all_genes %in% DE_sets[[comparison]], comparison] <- 1
+}
+
+# Calculate how many sets each gene appears in
+intersection_sizes <- rowSums(gene_matrix)
+
+# Filter the matrix to include only genes that appear in at least 30 comparisons
+filtered_gene_matrix <- gene_matrix[intersection_sizes >= 2, ]  # Adjust 30 to your desired overlap threshold
+
+
+pdf_file <- paste0(fig_path_stnx, "06_03_01_upset_DEGs_All_DE.pdf")
+# pdf_file <- paste0(fig_path_stnx, "06_03_01_upset_DEGs_top100_up_v4.pdf")
+pdf(pdf_file, width = 7, height = 6)
+
+# Create UpSet plot
+upset(
+  filtered_gene_matrix,
+  sets = names(DE_sets),
+  order.by = "freq",
+  nsets = length(DE_sets),
+  keep.order = TRUE,
+  sets.bar.color = "#6699CC",
+  main.bar.color = "#6699CC",
+  matrix.color = "#CC6677",
+  nintersects = 20
+)
+
+# Add title using grid graphics
+grid.text("All DEGs Gene abs(lfc)>0 Overlaps", x = 0.2, y = 0.98, gp = gpar(fontsize = 10))
+
+dev.off()
+
+
+
+#========================= Creating directional Venn diagrams
+
+# Function to create directional Venn diagrams
+create_directional_venn <- function(comparison_name, direction) {
+  
+  scRNA_key <- paste0(direction, "_scRNA_", comparison_name)
+  snRNA_key <- paste0(direction, "_snRNA_", comparison_name)
+  
+  if (scRNA_key %in% names(overlap_list) && snRNA_key %in% names(overlap_list)) {
+    
+    pdf_file <- paste0(fig_path_stnx, "06_03_01_venn_", tolower(direction), "_", comparison_name, ".pdf")
+    pdf(pdf_file, width = 9, height = 9) 
+    
+    draw.pairwise.venn(
+      area1 = length(overlap_list[[scRNA_key]]),
+      area2 = length(overlap_list[[snRNA_key]]),
+      cross.area = length(intersect(overlap_list[[scRNA_key]], overlap_list[[snRNA_key]])),
+      category = c("scRNA", "snRNA"),
+      fill = c("#6699CC", "#CC6677"),
+      cex = 2.5,
+      cat.cex = 1,
+      lwd = 2
+    )
+    
+    title_text <- paste0(
+      ifelse(direction == "UP", "Upregulated", "Downregulated"), 
+      " DEGs: ", gsub("_", " vs ", comparison_name)
+    )
+    grid.text(title_text, x = 0.5, y = 0.95, gp = gpar(fontsize = 14, fontface = "bold"))
+    
+    dev.off()
+    cat("Generated:", pdf_file, "\n")
+  }
+}
+
+# Generate all directional comparison plots
+comparisons <- c("CD4vsCD8_T_cells", "CD16vsCD14_Monocyte", "Erythro_vsB_cells")
+directions <- c("UP", "DOWN")
+
+for (comp in comparisons) {
+  for (dir in directions) {
+    create_directional_venn(comp, dir)
+  }
+}
+
+
+
+```
+
+

@@ -1,0 +1,1593 @@
+---
+title: "03_Batch_Pre_processing_multiome_QC_features""
+author: "Reza Ghamsari"
+date: "2024-09"
+output: html_document
+---
+```{r setup, include=FALSE}
+all_times <- list()  # store the time for each chunk
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now)
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  time_it = TRUE
+)
+```
+#Description
+This script performs doublet detection and multi-step quality control filtering across all 22 samples (11 AML, 9 healthy BMMC, 2 AMS). After removing confirmed doublets, cells are filtered using fixed QC thresholds followed by a cluster-aware MAD-based outlier detection step. C Sample-specific features including chrX, chrY, chr7 genes and peaks, immunoglobulin/TCR variable genes, and haemoglobin genes are also removed from the final merged object.
+
+# Colors 
+```{r colors}
+my_colors <-c("#9d183299","#00A087FF", "#525ecc99","#E9967A", "#4DBBD5FF",  "#003C67FF", "#386cb0", "#7E6148FF",  "#ADB6B6FF"
+              , "#52a7cc99", "#F0E685FF", "#cc52c099",  "#6acc5299","#DC143C", "#802268FF" ,"#ffbb78", "#3C548899", "#189b3699",
+              "#cc9b5299", "#1f0fdf99", "#ccebc5", "#cc527699", "#42857599", "#868686FF", "#006400", "#0A47FFFF" , "#3B1B53FF", 
+              "#749B58FF" ,"#ccc05299", "#cc765299" , "#1B1919FF", "#00D68FFF" ,"#14FFB1FF","#3C5488FF" , "#8F7700FF" , "#164194FF" ,
+              "#0094CDFF" , "#FFDAB9", "#FF00FF","#00FFFF","green" , "blue",  "#480607")
+```
+# Configuration
+```{r config}
+project_root <- here::here()
+data_dir <- file.path(project_root, "data")
+output_dir <- file.path(project_root, "outputs")
+figures_dir <- file.path(project_root, "figures")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(figures_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+
+# Loading Packages
+```{r pkgs}
+script_title <- "03_Batch_Pre_processing_multiome_QC_features"
+packages <- c(
+  "scales", "Seurat", "Signac", "ggplot2", "scCustomize", "gridExtra", 
+  "parallelly", "parallel", "BiocParallel", "clustree", "RColorBrewer", 
+  "patchwork", "igraph", "tibble", "ddqcR", "tidyr", "dplyr", "tidyverse", 
+  "forcats", "Matrix", "EnsDb.Hsapiens.v86", "org.Hs.eg.db", "AnnotationDbi", 
+  "biomaRt", "scDblFinder", "harmony", "pheatmap", "cowplot"
+)
+
+invisible(lapply(packages, library, character.only = TRUE))
+sink(file.path(figures_dir, paste0(script_title ,"_sessionInfo.txt")))
+sessionInfo()
+sink()
+```
+
+After adding different qc features for each object across different batches in the previous script, I will now use scdbFinder to detect doublets. 
+I'm performing clustering before conducting quality control and removing outliers, based on the assumption that doublets behave like outliers. 
+By retaining them during clustering, I aim to improve scdbFinder's ability to identify these outliers more effectively.
+
+
+```{r reading object}
+multiome_list <- list()
+batch_names <- c("list_1_3", "list_4_7", "list_8_11", "list_12_15", "list_16_19", "list_20_22")
+
+for (batch_name in batch_names){
+  print(batch_name)
+ batch_list <- readRDS(file.path(output_dir,paste0("02_02_multiome_feature_pre_", batch_name, "_v1.rds")))
+ multiome_list <- c(multiome_list, batch_list)
+}
+length(multiome_list)
+```
+
+# Second round of Preprocessing for Doublet detection
+```{r clustering, fig.width=10}
+
+identical(multiome_list$Sample_1@assays$RNA@data, multiome_list$Sample_1@assays$RNA@counts) #TRUE
+identical(multiome_list$Sample_1@assays$ATAC@data, multiome_list$Sample_1@assays$ATAC@counts) #TRUE
+
+NormReduc <- function(x) {
+  DefaultAssay(x) <- "RNA"
+  x <- SCTransform(x, verbose = FALSE, vst.flavor = "v2", variable.features.n = 3000,new.assay.name= "SCT_doub") 
+  x <- RunPCA(x, reduction.name='pca_sct_doub', assay= "SCT_doub")
+  DefaultAssay(x) <- "ATAC"
+  x <- RunTFIDF(x)
+  x <- FindTopFeatures(x, min.cutoff = 'q25')
+  x <- RunSVD(x, reduction.name= 'lsi_doub',  reduction.key = "doub_LSI_")
+  x<- FindMultiModalNeighbors(x, reduction.list = list("pca_sct_doub", "lsi_doub"), dims.list = list(c(1:50), c(1:50)), snn.graph.name="wsnn_doub",  knn.graph.name = "wknn_doub",  weighted.nn.name = "weighted_doub.nn")
+  }
+
+multiome_list <- mclapply(multiome_list, NormReduc, mc.cores = detectCores() - 5, mc.preschedule = FALSE)
+```
+# Clustering
+```{r Clustering}
+
+resolutions <- unique(c(0.001, 0.0025, 0.015, 0.045, seq(0.005, 0.1, 0.01), seq(0.1, 1.5, 0.2), seq(2, 3, 0.5)))
+
+ ClusterParallel <- function(x, graph_name) {
+  graph <- x[[graph_name]]
+  x <- Seurat:::FindClusters.default(
+  object = graph, 
+  algorithm = 1, 
+  verbose = TRUE, 
+  random.seed = 0, 
+  resolution = resolutions, 
+  n.iter = 10
+)
+  return(x)
+}
+
+clustering_list <- mclapply(multiome_list, ClusterParallel, graph_name = "wsnn_doub", mc.cores = detectCores() - 5, mc.preschedule = FALSE)
+
+
+```
+
+## Clustree
+```{r clustree, fig.width=20}
+ClustreeParallel <- function(x, name) {
+  plot <- clustree(x, prefix = "res.", node_label_size = 4, node_text_size = 5, 
+                   node_alpha = 0.3, scale_node_text = FALSE, 
+                   node_size_range = c(4, 20)) +
+    scale_color_manual(values = my_colors) +
+    guides(color = guide_legend(ncol = 2)) +
+    ggtitle(paste("Clustree", name))
+  
+  return(plot)
+}
+
+page_plots <- mclapply(seq_along(clustering_list), function(i) {
+  ClustreeParallel(clustering_list[[i]], names(clustering_list)[i])
+}, mc.cores = detectCores() - 5, mc.preschedule = FALSE)
+
+names(page_plots) <- names(clustering_list)
+
+
+
+pdf(file = file.path(figures_dir, "03_Clustree_wnn_11AML_9healthy_2AMS_samples_before_doublet_detection_before_QC.pdf"), width = 30, height = 25,  pointsize = 5) 
+for (plot in page_plots) {
+  print(plot)
+}
+dev.off()
+```
+
+## cluster annotation:
+based on best stability in clustree visualization, I chose the best resolution for each sample.
+```{r}
+# Manually assigning clustering values to multiome_list for each sample
+multiome_list$Sample_1$cluster_doublet <- clustering_list$Sample_1$res.1.1
+multiome_list$Sample_3$cluster_doublet <- clustering_list$Sample_3$res.1.1
+multiome_list$Sample_5$cluster_doublet <- clustering_list$Sample_5$res.0.9
+multiome_list$Sample_7$cluster_doublet <- clustering_list$Sample_7$res.0.9
+multiome_list$Sample_10$cluster_doublet <- clustering_list$Sample_10$res.0.9
+multiome_list$Sample_13$cluster_doublet <- clustering_list$Sample_13$res.1.1
+multiome_list$Sample_16$cluster_doublet <- clustering_list$Sample_16$res.0.9
+multiome_list$Sample_18$cluster_doublet <- clustering_list$Sample_18$res.1.1
+multiome_list$Sample_20$cluster_doublet <- clustering_list$Sample_20$res.1.5
+multiome_list$Sample_22$cluster_doublet <- clustering_list$Sample_22$res.1.1
+multiome_list$Sample_24$cluster_doublet <- clustering_list$Sample_24$res.1.1
+multiome_list$BMMC_S1_D1$cluster_doublet <- clustering_list$BMMC_S1_D1$res.1.1
+multiome_list$BMMC_S1_D2$cluster_doublet <- clustering_list$BMMC_S1_D2$res.0.7
+multiome_list$BMMC_S1_D3$cluster_doublet <- clustering_list$BMMC_S1_D3$res.1.3
+multiome_list$BMMC_S2_D1$cluster_doublet <- clustering_list$BMMC_S2_D1$res.1.3
+multiome_list$BMMC_S3_D6$cluster_doublet <- clustering_list$BMMC_S3_D6$res.1.5
+multiome_list$BMMC_S3_D7$cluster_doublet <- clustering_list$BMMC_S3_D7$res.0.9
+multiome_list$BMMC_S4_D1$cluster_doublet <- clustering_list$BMMC_S4_D1$res.0.5
+multiome_list$BMMC_S4_D8$cluster_doublet <- clustering_list$BMMC_S4_D8$res.0.5
+multiome_list$BMMC_S4_D9$cluster_doublet <- clustering_list$BMMC_S4_D9$res.0.9
+multiome_list$`6279DN`$cluster_doublet <- clustering_list$`6279DN`$res.0.9
+multiome_list$`6905DN`$cluster_doublet <- clustering_list$`6905DN`$res.1.3
+```
+
+# multiplet rate
+Here I compare scDblFinder's default `dbr` calculation method with the 10x Multiome manual multiplet rate. 
+For samples with high cell counts, the default method appeared to overestimate doublet rates, 
+so I used a modified exponential model fitted to the 10x protocol data instead.
+
+```{r}
+
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@  sdblfinder default dbr calculation method
+calculate_dbr <- function(cell_counts) {
+  dbr <- weighted.mean(cell_counts / 100000, cell_counts)
+  return(dbr)
+}
+
+num_cells <- seq(1000, 20000, 1000)
+
+dbr_values <- sapply(num_cells, calculate_dbr)
+
+
+plot_data <- data.frame(CellCounts = num_cells, DBR = dbr_values)
+
+
+ggplot(plot_data, aes(x = CellCounts, y = DBR)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(color = "red", size = 2) +
+  labs(title = "DBR vs. Cell Counts/ based on weighted.mean(cell_counts / 100000, cell_counts) \n scDblFinder",
+       x = "Cell Counts",
+       y = "DBR") +
+  theme_minimal()
+
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@  10x protocol data
+
+# Defining the data from the table
+multiplet_rate <- c(0.004, 0.008, 0.016, 0.023, 0.031, 0.039, 0.046, 0.054, 0.062, 0.069, 0.077, 0.12, 0.16)
+targeted_nuclei <- c(500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 15000, 20000)
+
+# Fit an exponential model
+exponential_model <- nls(multiplet_rate ~ a * exp(b * targeted_nuclei), start = list(a = 0.004, b = 0.0005))
+model_params <- summary(exponential_model)$coefficients
+
+# Defining the function to calculate multiplet rate based on the fitted model
+calculate_multiplet_rate <- function(targeted_nuclei) {
+  a <- model_params[1, 1]
+  b <- model_params[2, 1]
+  multiplet_rate <- a * exp(b * targeted_nuclei)
+  return(multiplet_rate)
+}
+
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+# Generate nuclei counts for plotting
+nuclei_counts <- seq(500, 20000, 500)
+fitted_multiplet_rates <- calculate_multiplet_rate(nuclei_counts)
+plot_data <- data.frame(TargetedNuclei = targeted_nuclei, MultipletRate = multiplet_rate)
+fitted_data <- data.frame(TargetedNuclei = nuclei_counts, MultipletRate = fitted_multiplet_rates)
+ggplot() +
+  geom_point(data = plot_data, aes(x = TargetedNuclei, y = MultipletRate), color = "red", size = 2) +
+  geom_line(data = fitted_data, aes(x = TargetedNuclei, y = MultipletRate), color = "blue", size = 1) +
+  labs(title = "Modified dbr based on 10x protocol \n multiplet_rate <- a * exp(b * targeted_nuclei)",
+       x = "Nuclei Counts",
+       y = "DBR") +
+  theme_minimal()
+
+
+
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@  comparison of my modified dbr and default one 
+results <- data.frame(
+  SampleName = character(),
+  CellNumber = numeric(),
+  DBR_Modified = numeric(),
+  DBR_ScDblFinder = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Looping through the samples in multiome_list and calculate the doublet rates
+for (sobj in names(multiome_list)) {
+  sobject <- multiome_list[[sobj]]
+  sample_Name <- sobj
+  cell_number <- ncol(sobject)
+  dbr_modified <- calculate_multiplet_rate(cell_number)
+  dbr_scdbfinder <- calculate_dbr(cell_number)
+ 
+   results <- rbind(results, data.frame(
+    SampleName = sample_Name,
+    CellNumber = cell_number,
+    DBR_Modified = dbr_modified,
+    DBR_ScDblFinder = dbr_scdbfinder
+  ))
+}
+
+results <- results[order(results$DBR_Modified), ]
+
+# Converting SampleName to a factor to retain the order in the plot
+results$SampleName <- factor(results$SampleName, levels = results$SampleName)
+
+print(results)
+
+ggplot(results, aes(x = SampleName)) +
+  geom_line(aes(y = DBR_Modified, color = "Modified DBR", group = 1)) +
+  geom_line(aes(y = DBR_ScDblFinder, color = "ScDblFinder DBR", group = 1)) +
+  geom_point(aes(y = DBR_Modified, color = "Modified DBR")) +
+  geom_point(aes(y = DBR_ScDblFinder, color = "ScDblFinder DBR")) +
+  labs(title = "Doublet Rate Comparison",
+       x = "Sample Name",
+       y = "Doublet Rate",
+       color = "Legend") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))  
+
+```
+
+
+# RNA Doublet detection
+I used modified dbr here
+
+```{r, RNA Doublet detection}
+bp <- MulticoreParam(3, RNGseed=1234) #Because it relies on the partly random generation of artificial doublets, running scDblFinder multiple times on the same data will yield slightly different results. 
+# We can ensure reproducibility using set.seed(123), however this will not be sufficient when processing multiple samples (i.e. using the samples argument – even without multithreading!). In such case, the seed needs to be passed to the BPPARAMs:
+# BPPARAM=bp)
+
+# Function for doublet finder 
+DOUBLET_detect <- function(sample) {
+  db <- calculate_multiplet_rate(ncol(sample))
+  scDblFinder::scDblFinder(Seurat::GetAssayData(sample, slot = "counts", assay = "RNA"), 
+                   clusters = sample$cluster_doublet,
+                   processing="default", 
+                     returnType = c("sce", "table", "full", "counts"),
+                   verbose = TRUE,
+                  dbr= db,
+                   BPPARAM = bp)
+}
+
+RNA_doublet_list_scdbfinder <- purrr::map(multiome_list, DOUBLET_detect)
+MAKE_TABLE <- function(obj, id) {
+  df <- as.data.frame(table(obj$scDblFinder.class))
+  df$Sample <- id
+  return(df)
+}
+
+
+#Iterateing over names of the list for Sample IDs
+combined_df <- purrr::map2_df(RNA_doublet_list_scdbfinder, names(RNA_doublet_list_scdbfinder), MAKE_TABLE)
+reshaped_df <- combined_df %>%
+  spread(key = Var1, value = Freq)
+reshaped_df <- reshaped_df %>%
+  mutate(doublet_percentage = 100 * doublet / (doublet + singlet))
+
+
+write.csv(reshaped_df, file = file.path(figures_dir, "03_Doublet_percentage__RNA_11AML_9healthy_2AMS_modified_md_dbr.csv"), row.names = T)
+reshaped_df$Total_cell <- reshaped_df$singlet +reshaped_df$doublet
+
+ 
+
+file_path <- file.path(figures_dir, "03_Doublet_percentage__RNA_11AML_9healthy_2AMS_modified_md_dbr.png")
+
+png(file_path, width = 2000, height = 1000, res = 130)
+
+# Setting up the layout for two plots side by side
+par(mfrow = c(1, 2))
+
+plot(reshaped_df$Total_cell, reshaped_df$doublet_percentage,
+     xlab = "Total Cell", ylab = "Doublet Percentage",
+     main = "Doublet Percentage vs Total number of Nuclei (22 samples, unfiltered, md_dbr)")
+abline(lm(doublet_percentage ~ Total_cell, data = reshaped_df), col = "red")
+
+plot(reshaped_df$Total_cell, reshaped_df$doublet,
+     xlab = "Total Cell", ylab = "Doublet number",
+     main = "Doublet number vs Total number of Nuclei (22 samples, unfiltered, md_dbr)")
+abline(lm(doublet ~ Total_cell, data = reshaped_df), col = "red")
+
+dev.off()
+
+
+
+
+
+for (i in names(multiome_list)) {
+  for( j in names(RNA_doublet_list_scdbfinder)) {
+    if (i == j) {
+      print(paste("Checking identity for", i))
+      is_identical <- identical(rownames(multiome_list[[i]]@meta.data),
+                                colnames(RNA_doublet_list_scdbfinder[[j]]))
+      print(is_identical)
+    }
+  }
+}
+
+
+
+for (i in names(multiome_list)) {
+  for( j in names(RNA_doublet_list_scdbfinder)) {
+    if (i == j) {
+      multiome_list[[i]]@meta.data$scDblFinder_RNA_counts = RNA_doublet_list_scdbfinder[[j]]$scDblFinder.class
+    }
+  }
+}
+
+
+for (i in names(multiome_list)) {
+  for( j in names(RNA_doublet_list_scdbfinder)) {
+    if (i == j) {
+      multiome_list[[i]]@meta.data$scDblFinder_RNA_counts_score = RNA_doublet_list_scdbfinder[[j]]$scDblFinder.score
+    }
+  }
+}
+
+
+
+for (i in names(multiome_list)) {
+  for( j in names(RNA_doublet_list_scdbfinder)) {
+    if (i == j) {
+      print(paste("Checking identity for", i))
+      is_identical <- identical(multiome_list[[i]]@meta.data$scDblFinder_RNA_counts,
+                                RNA_doublet_list_scdbfinder[[j]]$scDblFinder.class)
+      print(is_identical)
+    }
+  }
+}
+
+
+```
+
+
+
+# ATAC Doublet detection
+https://bioconductor.org/packages/release/bioc/vignettes/scDblFinder/inst/doc/scATAC.html
+
+```{r, ATAC Doublet detection}
+bp <- MulticoreParam(3, RNGseed=1234) 
+DOUBLET_ATAC <- function(sample) {
+  db <- calculate_multiplet_rate(ncol(sample))
+  scDblFinder::scDblFinder(Seurat::GetAssayData(sample, slot = "counts", assay = "ATAC"), 
+                   clusters = sample$cluster_doublet,
+                  artificialDoublets=NULL,
+                   aggregateFeatures=TRUE, 
+                   nfeatures=25,
+                  processing="rawFeatures",
+                    returnType = c("sce", "table", "full", "counts"),
+                  dbr= db,
+                   verbose = TRUE,
+                   BPPARAM = bp)
+}
+
+
+atac_doublet_list_scdbfinder <- purrr::map(multiome_list, DOUBLET_ATAC)
+
+MAKE_TABLE <- function(obj, id) {
+  df <- as.data.frame(table(obj$scDblFinder.class))
+  df$Sample <- id
+  return(df)
+}
+
+
+# Using map2 to also iterate over names of the list for Sample IDs
+combined_df <- purrr::map2_df(atac_doublet_list_scdbfinder, names(atac_doublet_list_scdbfinder), MAKE_TABLE)
+
+
+reshaped_df <- combined_df %>%
+  spread(key = Var1, value = Freq)
+reshaped_df <- reshaped_df %>%
+  mutate(doublet_percentage = 100 * doublet / (doublet + singlet))
+reshaped_df$Total_cells <- reshaped_df$singlet +reshaped_df$doublet
+
+write.csv(reshaped_df, file = file.path(figures_dir, "03_Doublet_percentage_ATAC_11AML_9healthy_2AMS_modified_md_dbr.csv"), row.names = T)
+
+```
+
+#Integrating doublet annotations from ATAC and RNA
+In this section, ATAC-based doublet detection results from **scDblFinder** are integrated 
+ combined doublet classification (`scDblFinder_Doublets`) is created to distinguish:  
+  - `Doublet_both` (detected in both RNA and ATAC),  
+  - `Doublet_ATAC` (detected only in ATAC),  
+  - `Doublet_RNA` (detected only in RNA),  
+  - `singlet`.  
+```{r integrating the annotation}
+for (i in names(multiome_list)) {
+  for( j in names(atac_doublet_list_scdbfinder)) {
+    if (i == j) {
+      print(paste("Checking identity for", i))
+      is_identical <- identical(rownames(multiome_list[[i]]@meta.data),
+                                colnames(atac_doublet_list_scdbfinder[[j]]))
+      print(is_identical)
+    }
+  }
+}
+
+
+
+for (i in names(multiome_list)) {
+  for( j in names(atac_doublet_list_scdbfinder)) {
+    if (i == j) {
+      multiome_list[[i]]@meta.data$scDblFinder_ATAC_counts = atac_doublet_list_scdbfinder[[j]]$scDblFinder.class
+    }
+  }
+}
+
+for (i in names(multiome_list)) {
+  for( j in names(atac_doublet_list_scdbfinder)) {
+    if (i == j) {
+      multiome_list[[i]]@meta.data$scDblFinder_ATAC_counts_score = atac_doublet_list_scdbfinder[[j]]$scDblFinder.score
+    }
+  }
+}
+
+for (i in names(multiome_list)) {
+  for( j in names(atac_doublet_list_scdbfinder)) {
+    if (i == j) {
+      print(paste("Checking identity for", i))
+      is_identical <- identical(multiome_list[[i]]@meta.data$scDblFinder_ATAC_counts,
+                                atac_doublet_list_scdbfinder[[j]]$scDblFinder.class)
+      print(is_identical)
+    }
+  }
+}
+
+
+multiome_list <- lapply(multiome_list, function(x) {
+  x@meta.data[["scDblFinder_Doublets"]] <- 
+ ifelse (
+   x@meta.data[["scDblFinder_ATAC_counts"]] == "doublet" & x@meta.data[["scDblFinder_RNA_counts"]] == "doublet", "Doublet_both" ,
+   ifelse(
+     x@meta.data[["scDblFinder_ATAC_counts"]] == "doublet" & x@meta.data[["scDblFinder_RNA_counts"]] == "singlet","Doublet_ATAC" ,
+     ifelse(
+       x@meta.data[["scDblFinder_RNA_counts"]] == "doublet" & x@meta.data[["scDblFinder_ATAC_counts"]] == "singlet","Doublet_RNA", 
+       "singlet"
+     )
+   )
+ )
+  x
+  })
+
+table(multiome_list$Sample_10$scDblFinder_Doublets)
+
+meta_data_list <- list()
+
+for (donor in names(multiome_list)) {
+  meta_data <- multiome_list[[donor]]@meta.data
+  meta_data_list[[donor]] <- meta_data}
+
+  
+saveRDS(meta_data_list, file = file.path(output_dir, "03_meta_data_list_11AML_9healthy_2AMS_doublet_Removed_before_qc.rds"))
+
+```
+
+
+# removing cells that are doublet for both
+```{r}
+meta_data_list <- readRDS(file.path(output_dir, "03_meta_data_list_11AML_9healthy_2AMS_doublet_Removed_before_qc.rds"))
+for (donor in names(multiome_list)) {
+  meta_data <- meta_data_list[[donor]]
+  multiome_list[[donor]]@meta.data <- meta_data}
+
+
+
+for (sobj_name in names(multiome_list)) {
+  sobj <- multiome_list[[sobj_name]]
+  print(sobj_name)
+  # sobj_name@assays$SCT_doub <- NULL #remove the extra assay to save space
+  print(paste0("before filtering: ",length(colnames(sobj))))
+  DefaultAssay(sobj) <- "RNA"
+    sobj <- subset(
+      x = sobj,
+      subset = scDblFinder_Doublets != "Doublet_both"
+    ) 
+    
+    # Update the Seurat object in the list
+    print(paste0("After filtering: ", length(colnames(sobj))))
+    multiome_list[[sobj_name]] <- sobj}
+
+```
+#removing outliers based on quantiles
+To remove low-quality cells, we applied a soft QC threshold and Cells falling below the 0.2 percent quantile or above the 99.8 percent quantile for any feature are flagged as `"outlier"`. 
+```{r  removing quantile}
+lower_quantile <- 0.002
+upper_quantile <- 0.998
+features <- c("nCount_RNA", "nFeature_RNA", "nCount_ATAC", "nFeature_ATAC")
+
+# A function to identify outliers for a sample
+identify_sample_outliers <- function(sobj, features, lower_quantile, upper_quantile) {
+  is_outlier <- rep("passed", nrow(sobj@meta.data))  # Initialised as "passed"
+  
+  for (feature in features) {
+    feature_data <- sobj@meta.data[[feature]]
+    lower_bound <- quantile(feature_data, probs = lower_quantile, na.rm = TRUE)
+    upper_bound <- quantile(feature_data, probs = upper_quantile, na.rm = TRUE)
+    is_outlier <- ifelse(is_outlier == "passed" & (feature_data < lower_bound | feature_data > upper_bound), "outlier", is_outlier)
+  }
+  return(is_outlier)
+}
+
+# Loop over samples
+for (sample in names(multiome_list)) {
+  print(sample)
+  sobj <- multiome_list[[sample]]
+  outliers <- identify_sample_outliers(sobj, features, lower_quantile, upper_quantile)
+  print(table(outliers))
+  multiome_list[[sample]]$outlier <- NULL
+   multiome_list[[sample]]$quantile_004_percent <- outliers
+}
+
+
+table(multiome_list$Sample_10$quantile_004_percent)
+# outlier  passed 
+#      99   10409
+```
+# violin plot QC
+```{r}
+
+features <- c("nCount_RNA", "nFeature_RNA", "nCount_ATAC", "nFeature_ATAC", "percentage_MT", "percentage_HB" , "percentage_RB", "percentage_Malat1", "nucleosome_signal", "TSS.enrichment" , "blacklist_fraction", "nucleosome_signal",
+              "percentage_chrY_genes", "percentage_chrX_genes",
+  "percentage_chr7_peaks_temp", "percentage_chr1_peaks", "percentage_chr2_peaks", "percentage_chr3_peaks",
+  "percentage_chr4_peaks", "percentage_chr5_peaks", "percentage_chr6_peaks", "percentage_chr7_peaks",
+  "percentage_chr8_peaks", "percentage_chr9_peaks", "percentage_chr10_peaks", "percentage_chr11_peaks",
+  "percentage_chr12_peaks", "percentage_chr13_peaks", "percentage_chr14_peaks", "percentage_chr15_peaks",
+  "percentage_chr16_peaks", "percentage_chr17_peaks", "percentage_chr18_peaks", "percentage_chr19_peaks",
+  "percentage_chr20_peaks", "percentage_chr21_peaks", "percentage_chr22_peaks", "percentage_chrX_peaks",
+  "percentage_chrY_peaks", "percentage_chr7_genes", "percentage_chrMT_genes",
+
+  "percentage_redblood.HBB_HBA2", "percentage_plat",
+  "percentage_CD117", "percentage_CD33", "percentage_CD34", "percentage_FLT3", "percentage_NPM1", "percentage_t_cells",
+  "percentage_monocytes", "percentage_granulocytes", "percentage_B_cell_markers", "percentage_NK_cell_markers",
+  "percentage_endothelial_cells", "percentage_erythroid_cells", "percentage_megakaryocytes", "percentage_CEBPA",
+  "percentage_RUNX1", "percentage_MLL", "percentage_TP53", "percentage_IDH1", "percentage_IDH2", "percentage_TET2",
+  "percentage_CBX7", "percentage_DNMT3A", "percentage_BCL2", "percentage_BCL2L1", "percentage_MCL1", "percentage_Ig_variable_markers",
+  "percentage_Ig_markers"
+)
+
+samples <- names(multiome_list)
+
+pdf(file = file.path(figures_dir, "03_Violine_plot_multiome_list_11AML_9healthy_2AMS_doublet_Removed_before_qc_not_log.pdf") , width = 20, height = 10)
+# pdf(file = file.path(figures_dir, "03_Violine_plot_multiome_list_11AML_9healthy_2AMS_doublet_Removed_before_qc_log.pdf") , width = 20, height = 10)
+
+# Loop over each feature
+for (feature in features) {
+  combined_data <- do.call(rbind, lapply(samples, function(sample) {
+    if (feature %in% colnames(multiome_list[[sample]]@meta.data)) {
+      data.frame(Sample = sample, FeatureValue = multiome_list[[sample]]@meta.data[[feature]])
+    }
+  }))
+  
+  p <- ggplot(combined_data, aes(x = Sample, y = FeatureValue, fill = Sample)) + 
+        geom_violin(trim = FALSE, color = NA)  +  
+        geom_jitter(width = 0.4, size = 0.1, alpha = 0.1, color = "gray") +
+      scale_fill_manual(values = my_colors) +
+       # scale_y_log10() +  # 
+       labs(title = paste("Violin Plot for", feature), 
+            x = "Samples", 
+            y = feature) +
+       theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1),  
+             panel.grid.major = element_blank(),  
+             panel.grid.minor = element_blank())
+
+  print(p)
+}
+
+dev.off()
+```
+
+
+# Subsetting filtered cells
+
+To remove low-quality cells, we applied a soft QC threshold and Cells falling below the 0.2 percent quantile or above the 99.8 percent quantile for any feature are flagged as `"outlier"`. For ATAC, cells with 300–150,000 counts and 300–50,000 detected features were retained, while for RNA, cells with 200–100,000 counts and 200–6,000 detected genes were kept. Additional filters excluded cells with >10\% of reads mapping to MALAT1, >40% to ribosomal genes, >5% to mitochondrial genes, or >3% of fragments overlapping ENCODE blacklist regions. Cells with nucleosome signal more than 4 or transcription start site (TSS) enrichment less than 3 were also removed. 
+```{r subsetting}
+removed_cells_counts <- list()
+for (sample in names(multiome_list)) {
+  print(sample)
+  sobj <- multiome_list[[sample]]
+  col1 <- ncol(sobj)
+  sobj <- subset(
+  x = sobj,
+  subset = 
+    nCount_ATAC > 300 &
+    nCount_ATAC < 150000 &
+    nFeature_ATAC > 300 &
+    nFeature_ATAC < 50000 &
+    nCount_RNA > 200 &
+    nCount_RNA < 100000 &
+     nFeature_RNA < 6000 &
+    nFeature_RNA > 200 &
+    percentage_Malat1 < 10 &
+    percentage_RB < 40 &
+    percentage_MT < 5 &
+    blacklist_fraction < 0.03 &
+    nucleosome_signal < 4 & 
+    TSS.enrichment > 3 &
+    quantile_004_percent == "passed"
+
+)
+
+# visualisation
+ multiome_list[[sample]] <- sobj
+    col2 <- ncol(sobj)
+    removed_cells_counts[[sample]] <- print(paste0("removed cells in ", sample," = ", col1-col2, "out of = " , col1, " cells."))
+    print(paste0("removed cells in ", sample," = ", col1-col2))
+}
+
+# Save counts to a text file
+write.table(removed_cells_counts, file.path(figures_dir, "03_first_removed_cells_based_on_violin_before_ddqc_v1.txt"), row.names = TRUE, col.names = TRUE)
+
+```
+# Biolody aware QC
+```{r clustering, }
+identical(multiome_list$Sample_1@assays$RNA@data, multiome_list$Sample_1@assays$RNA@counts) #TRUE
+identical(multiome_list$Sample_1@assays$ATAC@data, multiome_list$Sample_1@assays$ATAC@counts) #TRUE
+NormReduc <- function(x) {
+  DefaultAssay(x) <- "RNA"
+  x <- SCTransform(x, verbose = FALSE, vst.flavor = "v2", variable.features.n = 3000,new.assay.name= "SCT_QC") 
+  x <- RunPCA(x, reduction.name='pca_sct_QC', assay= "SCT_QC")
+  DefaultAssay(x) <- "ATAC"
+x <- RunTFIDF(x)
+x <- FindTopFeatures(x, min.cutoff = 'q25')
+x <- RunSVD(x, reduction.name= 'lsi_QC',  reduction.key = "QC_LSI_")
+x<- FindMultiModalNeighbors(x, reduction.list = list("pca_sct_QC", "lsi_QC"), dims.list = list(c(1:50), c(2:40)), snn.graph.name="wsnn_QC",  knn.graph.name = "wknn_QC",  weighted.nn.name = "weighted_QC.nn")
+
+}
+
+multiome_list <- mclapply(multiome_list, NormReduc, mc.cores = detectCores() - 10, mc.preschedule = FALSE)
+for (sobj_name in names(multiome_list)) {
+  # Retrieve the Seurat object
+  sobj <- multiome_list[[sobj_name]]
+  print(sobj_name)
+  sobj@assays$SCT_QC <- NULL #remove the extra assay to save space
+  multiome_list[[sobj_name]] <- sobj
+    }
+    
+```
+
+
+## clustering 
+```{r, clustering}
+
+resolutions <- unique(c(0.001, 0.0025, 0.015, 0.045, seq(0.005, 0.1, 0.01), seq(0.1, 1.5, 0.2), seq(2, 3, 0.5)))
+ ClusterParallel <- function(x, graph_name) {
+  graph <- x[[graph_name]]
+  x <- Seurat:::FindClusters.default(
+  object = graph, 
+  algorithm = 1, 
+  verbose = TRUE, 
+  random.seed = 0, 
+  resolution = resolutions, 
+  n.iter = 10
+)
+  return(x)
+}
+
+clustering_list_QC <- mclapply(multiome_list, ClusterParallel, graph_name = "wsnn_QC", mc.cores = detectCores() - 5, mc.preschedule = FALSE)
+
+
+```
+
+
+## clustree
+```{r}
+ClustreeParallel <- function(x, name) {
+  plot <- clustree(x, prefix = "res.", node_label_size = 4, node_text_size = 5, 
+                   node_alpha = 0.3, scale_node_text = FALSE, 
+                   node_size_range = c(4, 20)) +
+    scale_color_manual(values = my_colors) +
+    guides(color = guide_legend(ncol = 2)) +
+    ggtitle(paste("Clustree", name))
+  
+  return(plot)
+}
+
+page_plots <- mclapply(seq_along(clustering_list_QC), function(i) {
+  ClustreeParallel(clustering_list_QC[[i]], names(clustering_list_QC)[i])
+}, mc.cores = detectCores() - 5, mc.preschedule = FALSE)
+
+names(page_plots) <- names(clustering_list_QC)
+
+ pdf(file = file.path(figures_dir, "03_Clustree_wnn_11AML_9healthy_2AMS_samples_after_doublet_and_preqc_removal_before_ddQC.pdf"), width = 30, height = 25,  pointsize = 5) 
+
+for (plot in page_plots) {
+  print(plot)
+}
+ 
+dev.off()
+
+```
+## cluster selection:
+based on best stability in clustree visualization, I chose the best resolution for each sample.
+```{r}
+# Manually assigning resolution values to multiome_list for each sample
+multiome_list$Sample_1$cluster_QC <- clustering_list_QC$Sample_1$res.0.3
+multiome_list$Sample_3$cluster_QC <- clustering_list_QC$Sample_3$res.0.3
+multiome_list$Sample_5$cluster_QC <- clustering_list_QC$Sample_5$res.0.3
+multiome_list$Sample_7$cluster_QC <- clustering_list_QC$Sample_7$res.0.9
+multiome_list$Sample_10$cluster_QC <- clustering_list_QC$Sample_10$res.0.3
+multiome_list$Sample_13$cluster_QC <- clustering_list_QC$Sample_13$res.0.5
+multiome_list$Sample_16$cluster_QC <- clustering_list_QC$Sample_16$res.0.9
+multiome_list$Sample_18$cluster_QC <- clustering_list_QC$Sample_18$res.1.1
+multiome_list$Sample_20$cluster_QC <- clustering_list_QC$Sample_20$res.0.7
+multiome_list$Sample_22$cluster_QC <- clustering_list_QC$Sample_22$res.2
+multiome_list$Sample_24$cluster_QC <- clustering_list_QC$Sample_24$res.1.1
+multiome_list$BMMC_S1_D1$cluster_QC <- clustering_list_QC$BMMC_S1_D1$res.0.3
+multiome_list$BMMC_S1_D2$cluster_QC <- clustering_list_QC$BMMC_S1_D2$res.0.3
+multiome_list$BMMC_S1_D3$cluster_QC <- clustering_list_QC$BMMC_S1_D3$res.0.3
+multiome_list$BMMC_S2_D1$cluster_QC <- clustering_list_QC$BMMC_S2_D1$res.0.3
+multiome_list$BMMC_S3_D6$cluster_QC <- clustering_list_QC$BMMC_S3_D6$res.0.7
+multiome_list$BMMC_S3_D7$cluster_QC <- clustering_list_QC$BMMC_S3_D7$res.0.9
+multiome_list$BMMC_S4_D1$cluster_QC <- clustering_list_QC$BMMC_S4_D1$res.0.3
+multiome_list$BMMC_S4_D8$cluster_QC <- clustering_list_QC$BMMC_S4_D8$res.0.085
+multiome_list$BMMC_S4_D9$cluster_QC <- clustering_list_QC$BMMC_S4_D9$res.0.5
+multiome_list$`6279DN`$cluster_QC <- clustering_list_QC$`6279DN`$res.0.5
+multiome_list$`6905DN`$cluster_QC <- clustering_list_QC$`6905DN`$res.0.5
+
+
+meta_data_list_qc <- list()
+
+for (donor in names(multiome_list)) {
+  meta_data <- multiome_list[[donor]]@meta.data
+  meta_data_list_qc[[donor]] <- meta_data}
+saveRDS(meta_data_list_qc, file = file.path(output_dir, "03_meta_data_list_11AML_9healthy_2AMS_doublet_OUTLIERS_Removed_Clusrer_QC_before_qc.rds"))
+
+
+# meta_data_list_qc <- readRDS(file.path(output_dir, "03_meta_data_list_11AML_9healthy_2AMS_doublet_OUTLIERS_Removed_Clusrer_QC_before_qc.rds"))
+for (donor in names(multiome_list)) {
+  meta_data <- meta_data_list_qc[[donor]]
+  multiome_list[[donor]]@meta.data <- meta_data}
+```
+
+
+# Violin plot log MAD Threshold MAD for each cluster
+```{r}
+nmads_up <- 3
+nmads_low <- 3
+log_plus_one_trans <- trans_new(
+  name = "log_plus_one",
+  transform = function(x) log(x + 1),
+  inverse = function(x) exp(x) - 1
+)
+
+all_features <- c("nCount_RNA", "nFeature_RNA", "nCount_ATAC", "nFeature_ATAC")
+group_by <- c("cluster_QC")
+get_bounds <- function(data, nmads_up, nmads_low) {
+    # Apply log1p transformation
+    log_data <- log1p(data)
+    median_log_data <- median(log_data, na.rm = TRUE)
+    mad_log_data <- mad(log_data, na.rm = TRUE)
+
+    # Calculating bounds in log scale
+    lower_bound_log <- median_log_data - nmads_low * mad_log_data
+    upper_bound_log <- median_log_data + nmads_up * mad_log_data
+
+    # Convert bounds back to original scale
+    lower_bound <- expm1(lower_bound_log)
+    upper_bound <- expm1(upper_bound_log)
+
+    return(c(upper_bound, lower_bound))
+}
+
+
+pdf(file = file.path(figures_dir, "03_violins_outliers_ddQC_4Features_log_3_3_MAD_22_samples.pdf"), width = 25, height = 22, pointsize = 5)
+
+# A function to plot and arrange a subset of plots on a page
+plot_page <- function(plots) {
+  num_plots <- length(plots)
+  num_cols <- 2  
+  num_rows <- ceiling(num_plots / num_cols)  # Calculating the number of rows
+
+  grid.arrange(grobs = plots, ncol = num_cols, nrow = num_rows)
+}
+
+# Iterating over all the plots
+page_plots <- list()
+
+for (sample in names(multiome_list)
+     ) {
+  for (group in group_by) {
+    for (feature in all_features) {
+     
+      data <- Seurat::FetchData(multiome_list[[sample]], vars = c(feature, group))
+      total_num_cells <- nrow(data)
+      data[[group]] <- factor(data[[group]], levels = unique(data[[group]]))  # To ensure consistent ordering of factor levels
+      outliers <- data.frame()
+      clusters <- levels(data[[group]])
+
+      outlier_counts <- vector("list", length = length(clusters))
+      names(outlier_counts) <- clusters
+
+      # Iterate over each group to calculate outliers
+      for (cluster_number in clusters) {
+      bounds <- get_bounds(data[[feature]][data[[group]] == cluster_number], nmads_up, nmads_low)
+      feature_data_max <- bounds[1]
+      feature_data_min <-  bounds[2]
+
+      clusters_outliers <- data[(data[[feature]] < feature_data_min | data[[feature]] > feature_data_max) & data[[group]] == cluster_number, ]
+      cluster_outlier_count <- nrow(clusters_outliers)
+      outlier_counts[[cluster_number]] <- cluster_outlier_count
+      outliers <- rbind(outliers, clusters_outliers)
+        }
+      max_y <- max(data[[feature]], na.rm = TRUE)
+      min_y <- min(data[[feature]], na.rm = TRUE)
+
+
+      data$is_outlier <- rownames(data) %in% rownames(outliers)
+      # Defining colors for outliers
+      outlier_colors <- c("TRUE" = "red" , "FALSE" = "#a6cee3") 
+      data$outlier_color <- outlier_colors[as.character(data$is_outlier)]
+
+       # To calculate total number of outliers for the caption
+      outliers_sum <- sum(unlist(outlier_counts))
+      legend_labels <- c("TRUE" = "Outlier", "FALSE" = "Passed")
+      print(outliers_sum)
+      try({
+        plot <- ggplot(data, aes_string(x = group, y = feature)) +
+          geom_jitter(aes(color = is_outlier), width = 0.3, size = 0.05, alpha = 0.8, show.legend= TRUE) +
+          scale_color_manual(
+          values = outlier_colors, 
+          labels = legend_labels,  
+          name = "QC"         
+          ) +
+        
+
+         geom_violin(aes_string(color = group), trim = FALSE, alpha = 0.9, fill = NA,  show.legend= TRUE) +
+         
+       labs(
+       title = paste0(sample, "(log+1)", ": -", nmads_low , "MAD > outliers > +", nmads_up,"MAD"),
+     # subtitle = paste0("total outlier number: ",outliers_sum),
+       caption = paste0("Total number of outlier detected:", outliers_sum, " out of ", total_num_cells, " cells" )
+     )+
+
+         scale_y_continuous(trans = log_plus_one_trans, breaks = round(exp(seq(log(min_y), log(max_y), by = (log(max_y) - log(min_y)) / 8))))+
+         theme(panel.background = element_rect(fill = "white"), 
+          plot.title = element_text(size = 10, face = "bold", hjust = 0.5,  vjust = -2),
+          plot.subtitle = element_text(size = 6, color = "black",  vjust = -3, hjust = 0.5),
+          plot.caption = element_text(size = 10, hjust = 0.5, color = "black"),
+          axis.title = element_text(size = 6, face = "bold", color = "black"),
+          axis.text = element_text(size = 6, face = "bold"))
+      # Adding the plot to the list of plots
+        for (cluster_level in levels(data[[group]])) {
+          cluster_number <- which(levels(data[[group]]) == cluster_level)
+          outlier_count <- outlier_counts[[cluster_level]]
+
+          x_offset <- 0  
+          y_multiplier <- 2.5
+
+        # New position for text
+          adjusted_x_position <- as.numeric(cluster_number) + x_offset
+          adjusted_y_position <- max_y * y_multiplier
+          plot <- plot + geom_text(
+            aes_string(x = adjusted_x_position, y = adjusted_y_position, label = outlier_count), 
+            color = "#9E0142" , 
+            fill = "gray",   # Background color of the label box:  geom_label was too slow; using geom_text instead
+            label.padding = unit(0.5, "lines")
+            )
+            }
+          }, silent = TRUE)
+
+
+      page_plots[[length(page_plots) + 1]] <- plot
+
+      if (length(page_plots) == 4) {
+        plot_page(page_plots)
+        page_plots <- list()
+      }
+    }
+  }
+}
+
+dev.off()
+
+```
+
+##Annotating outliers based on MAD 
+```{r}
+
+all_features <- c("nCount_RNA", "nFeature_RNA", "nCount_ATAC", "nFeature_ATAC")
+get_bounds <- function(data, nmads_up, nmads_low) {
+    # Apply log1p transformation
+    log_data <- log1p(data)
+    median_log_data <- median(log_data, na.rm = TRUE)
+    mad_log_data <- mad(log_data, na.rm = TRUE)
+
+    # Calculate bounds in log scale
+    lower_bound_log <- median_log_data - nmads_low * mad_log_data
+    upper_bound_log <- median_log_data + nmads_up * mad_log_data
+
+    # Convert bounds back to original scale
+    lower_bound <- expm1(lower_bound_log)
+    upper_bound <- expm1(upper_bound_log)
+
+    return(c(upper_bound, lower_bound))
+}
+
+
+OUTLIERS_FUN <- function(seurat_object, feature, clustering, nmads_up, nmads_low) {
+  seurat_object@meta.data[[clustering]] <- factor(seurat_object@meta.data[[clustering]], levels = unique(seurat_object@meta.data[[clustering]]))
+
+  all_outliers <- data.frame()  
+  
+  clusters <- unique(seurat_object@meta.data[[clustering]])
+  
+  for (cluster in clusters) {
+    # Subset data based on the current cluster
+    cluster_data <- seurat_object@meta.data[[feature]][seurat_object@meta.data[[clustering]] == cluster]
+    
+    # Calculate bounds for the current cluster
+    bounds <- get_bounds(cluster_data, nmads_up, nmads_low)
+    feature_data_max <- bounds[1]
+    feature_data_min <- bounds[2]
+    
+    # Detect outliers
+    clusters_outliers <- seurat_object@meta.data[(seurat_object@meta.data[[feature]] < feature_data_min | seurat_object@meta.data[[feature]] > feature_data_max) & seurat_object@meta.data[[clustering]] == cluster, ]
+    all_outliers <- rbind(all_outliers, clusters_outliers)
+  }
+  
+  # Marking outliers in seurat_object@meta.data
+  outlier_rows <- rownames(seurat_object@meta.data) %in% rownames(all_outliers)
+  seurat_object@meta.data$QC_MAD <- "Passed"
+  seurat_object@meta.data[outlier_rows, "QC_MAD"] <- "OUTLIER"
+  
+  return(seurat_object)
+}
+
+  
+
+multiome_list_outliers <- list()
+for (sobj in names(multiome_list)){
+  sobject <- multiome_list[[sobj]]
+  for (feature_out in all_features){
+  sobject <-  OUTLIERS_FUN(sobject, feature = feature_out, clustering= "cluster_QC", nmads_up= 3, nmads_low = 3)}
+  multiome_list_outliers[[sobj]] <- sobject
+}
+
+for (sobj in names(multiome_list_outliers)){
+  sobject <- multiome_list_outliers[[sobj]]
+  print(paste0(sobj,"= ", table(sobject@meta.data$QC_MAD)))}
+
+
+for (sobj in names(multiome_list_outliers)) {
+  sobject <- multiome_list_outliers[[sobj]]
+  qc_mad_table <- table(sobject@meta.data$QC_MAD)
+  
+  # To calculate the proportion of outliers
+  outlier_count <- qc_mad_table["OUTLIER"]
+  total_count <- sum(qc_mad_table)
+  proportion_outliers <- round(outlier_count / total_count*100)
+  print(paste0(sobj, " - Proportion of Outliers: ", proportion_outliers))
+}
+
+# Creating a vector to store the proportions
+proportion_outliers_vector <- numeric(length(names(multiome_list_outliers)))
+
+for (sobj in names(multiome_list_outliers)) {
+  sobject <- multiome_list_outliers[[sobj]]
+  qc_mad_table <- table(sobject@meta.data$QC_MAD)
+  
+  # Calculating the proportion of outliers
+  outlier_count <- qc_mad_table["OUTLIER"]
+  total_count <- sum(qc_mad_table)
+  proportion_outliers <- round(outlier_count / total_count * 100)
+  proportion_outliers_vector[sobj] <- proportion_outliers
+  print(paste0(sobj, " - Proportion of Outliers: ", proportion_outliers))
+}
+
+
+
+
+# Creating a data frame with the counts of outliers and total cells for each sample
+plot_data <- data.frame(
+  Object = names(multiome_list_outliers),
+  Total_Cells = sapply(multiome_list_outliers, function(sobj) ncol(sobj)),
+  Outliers = sapply(multiome_list_outliers, function(sobj) sum(sobj@meta.data$QC_MAD == "OUTLIER"))
+)
+
+# visualisation
+long_data <- gather(plot_data, key = "Category", value = "Count", -Object)
+
+cell_colors <- c("Total_Cells" = "#386cb0", "Outliers" = "#9E0142")
+
+
+# Create a stacked bar plot
+p <- ggplot(long_data, aes(x = Object, y = Count, fill = Category)) +
+  geom_bar(stat = "identity", position = "stack") +
+   scale_fill_manual(values = cell_colors) +
+  labs(title = "Number of Outliers in Each Sample (Detected by MAD=+-3 on log of each cluster)",
+       x = "Donors",
+       y = "Cell_Count") +
+  theme_minimal()+
+   theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.title = element_text(size = 10),  
+    panel.background = element_rect(fill = "white", color = NA),  
+    plot.background = element_rect(fill = "white", color = NA),   
+    panel.grid = element_blank()  
+  )
+
+
+
+
+ggsave(file.path(figures_dir, "03_outliers_propotion_based_log_data_3_3_mad_clusters_archive.png"), width = 10, height = 6, dpi = 300)
+
+meta_data_list_ddqc <- list()
+
+for (donor in names(multiome_list_outliers)) {
+  meta_data <- multiome_list_outliers[[donor]]@meta.data
+  meta_data_list_ddqc[[donor]] <- meta_data}
+
+saveRDS(meta_data_list_ddqc, file = file.path(output_dir, "03_meta_data_list_11AML_9healthy_2AMS_doublet_OUTLIERS_MAD3_QC_before_subseting.rds"))
+multiome_list <- multiome_list_outliers
+multiome_list_outliers <- NULL
+# meta_data_list_ddqc <- readRDS(file.path(output_dir, "03_meta_data_list_11AML_9healthy_2AMS_doublet_OUTLIERS_MAD3_QC_before_subseting.rds"))
+# for (donor in names(multiome_list)) {
+#   meta_data <- meta_data_list_ddqc[[donor]]
+#   multiome_list[[donor]]@meta.data <- meta_data}
+```
+
+
+# subsetting outliers
+```{r subsetting}
+table(multiome_list$BMMC_S4_D9$QC_MAD)
+# OUTLIER  Passed 
+#     532    5425 
+final_QC_metadata_list <- list()
+for (sobj_name in names(multiome_list)) {
+  sobj <- multiome_list[[sobj_name]]
+  print(sobj_name)
+  print(length(colnames(sobj)))
+  Seurat::DefaultAssay(sobj) <- "RNA"
+    sobj <- subset(
+      x = sobj,
+      subset = QC_MAD == "Passed"
+    ) 
+    print(paste0("After filtering: ", length(colnames(sobj))))
+    multiome_list[[sobj_name]] <- sobj
+   final_QC_metadata_list[[sobj_name]] <- sobj@meta.data }
+saveRDS(final_QC_metadata_list, file = file.path(output_dir, "03_meta_data_final_list_11AML_9healthy_2AMS_doublet_ddqc_all_OUTLIERS_Removed_Arcx.rds"))
+```
+
+# Cell Cycle Scoring
+
+```{r CellCycle}
+s.genes <- Seurat::cc.genes$s.genes
+g2m.genes <- Seurat::cc.genes$g2m.genes
+g2m.genes <- setdiff(g2m.genes, setdiff(g2m.genes, rownames(multiome_list$Sample_10)))
+s.genes <- setdiff(s.genes, setdiff(s.genes, rownames(multiome_list$Sample_10)))
+CELL_CYCLE <- function(x) {
+  Seurat::DefaultAssay(x) <- "RNA"
+  x <- NormalizeData(x)
+  x <- Seurat::CellCycleScoring(x, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+    return(x)
+}
+
+multiome_list <- lapply(multiome_list, CELL_CYCLE)
+
+table(multiome_list$Sample_10$Phase)
+#  G1  G2M    S 
+# 4241 1751 2224 
+
+```
+
+# barcode suffix correction
+
+```{r merge}
+for (donor in names(multiome_list)) {
+  obj <- multiome_list[[donor]]
+  obj@graphs$wknn_final <- NULL
+  obj@graphs$wsnn_final <- NULL
+  obj@reductions$pca_sct_final <- NULL
+  obj@reductions$lsi_final <- NULL
+  multiome_list[[donor]] <- obj}
+
+colnames(multiome_list$'6279DN')<- gsub("-1", "-39", colnames(multiome_list$'6279DN'))
+colnames(multiome_list$'6905DN')<- gsub("-2", "-40", colnames(multiome_list$'6905DN'))
+rownames(multiome_list$'6279DN'@meta.data)
+colnames(multiome_list$'6279DN'@assays$ATAC$counts)
+
+names(multiome_list)[names(multiome_list) == "6905DN"] <- "AMS_40_6905DN"
+names(multiome_list)[names(multiome_list) == "6279DN"] <- "AMS_39_6279DN"
+```
+
+#subsetting filtered cells
+
+Subsetting the original merged object to retain only QC-passed cells identified above
+
+```{r subsetting}
+meta_data_list_final <- list()
+
+for (donor in names(multiome_list)) {
+  meta_data <- multiome_list[[donor]]@meta.data
+  meta_data$CellCycle.Difference <- meta_data$S.Score - meta_data$G2M.Score
+  meta_data$nCount_RNA_raw <-  meta_data$nCount_RNA
+  meta_data$nFeature_RNA_raw <-  meta_data$nFeature_RNA
+  meta_data$nCount_ATAC_raw <-  meta_data$nCount_ATAC
+  meta_data$nFeature_ATAC_raw <-  meta_data$nFeature_ATAC 
+  
+  ##removing some extera columns
+  meta_data <- meta_data[, !colnames(meta_data) %in% c(
+  "QC_MAD", "nCount_SCT_final", "nFeature_SCT_final", "SCT_final.weight", 
+  "quantile_004_percent", "nCount_SCT_QC", "nFeature_SCT_QC", "SCT_QC.weight", 
+  "cluster_QC", "nCount_SCT_doub", "nFeature_SCT_doub", "SCT_doub.weight", 
+  "scDblFinder_RNA_counts", "scDblFinder_RNA_counts_score", 
+  "scDblFinder_ATAC_counts", "scDblFinder_ATAC_counts_score", "old.ident", "cluster_doublet", "ATAC.weight",
+  "nCount_RNA","nFeature_RNA", "nCount_ATAC", "nFeature_ATAC")]
+
+
+   multiome_list[[donor]]@meta.data <- meta_data
+  meta_data_list_final[[donor]] <- meta_data}
+
+#merging all the barcodes from different objects
+  barcode_list <- c()
+  for (obj in names(meta_data_list_final)){
+    barcode_list <- c(barcode_list , rownames(meta_data_list_final[[obj]]))
+    }
+ length(barcode_list) #138877
+ #I removed 27446 doublet and the rest during removing outliers
+
+saveRDS(meta_data_list_final, file = file.path(output_dir, "03_final_meta_data_list_11AML_9healthy_2AMS_after_qc_main_clusters_annotated.rds"))
+```
+
+# merging metadatas
+I only merged meta.data dfs from different filtered objs.
+
+```{r merging}
+# Combine the list of dataframes into one large dataframe while retaining row names
+merged_meta_data_22 <- bind_rows(meta_data_list_final) 
+
+dim(merged_meta_data_22) #138877     99
+saveRDS(merged_meta_data_22, file = file.path(output_dir, "03_final_merged_meta_data_11AML_9healthy_2AMS_after_qc_main_clusters_annotated_barcode39_40_v2.rds"))
+
+```
+
+# Subsetting merged data
+```{r subsetting data}
+
+Merge_obj  <- readRDS(file.path(output_dir, "01_merged_multiome_11AML_9_healthy_2AMS_before_doublet_and_qc.rds"))
+dim(Merge_obj) #184466 185243
+merged_meta_data <- readRDS(file.path(output_dir, "03_final_merged_meta_data_11AML_9healthy_2AMS_after_qc_main_clusters_annotated_barcode39_40_v2.rds"))
+dim(merged_meta_data) #138877     99
+
+
+filtered_barcodes <- rownames(merged_meta_data)
+length(filtered_barcodes) #138877
+
+Idents(Merge_obj) <- colnames(Merge_obj)
+
+
+# subsetting
+Merge_obj <- subset(
+  x = Merge_obj,
+  idents = filtered_barcodes
+)
+dim(Merge_obj) #184466 138877
+
+identical(
+rownames(Merge_obj@meta.data),
+rownames(merged_meta_data)) #FALSE
+
+setdiff(
+  rownames(Merge_obj@meta.data),
+rownames(merged_meta_data))
+
+ 
+# Reorder merged_meta_data to match the rownames of Merge_obj@meta.data
+merged_meta_data <- merged_meta_data[rownames(Merge_obj@meta.data), ]
+
+
+identical(
+rownames(Merge_obj@meta.data),
+rownames(merged_meta_data)) #TRUE
+
+
+identical(
+Merge_obj@meta.data$sample_id,
+merged_meta_data$sample_id) #TRUE
+
+identical(
+Merge_obj@meta.data$barcode,
+merged_meta_data$barcode) #FALSE
+
+Merge_obj@meta.data <- merged_meta_data
+dim(Merge_obj) #184466 138877
+dim(Merge_obj@meta.data) #138877     99
+
+Merge_obj@meta.data$barcode_10x <- Merge_obj@meta.data$barcode
+Merge_obj@meta.data$barcode <- colnames(Merge_obj)
+
+identical(merged_meta_data$barcode, Merge_obj@meta.data$barcode_10x) #TRUE
+identical(colnames(Merge_obj), Merge_obj@meta.data$barcode) #TRUE
+identical(colnames(Merge_obj), as.character(Idents(Merge_obj))) #TRUE
+
+
+```
+
+# Converting discrete data to Categorical for later visualisation 
+```{r Categorical, fig.width=30, fig.height=10}
+columns_to_process <- c("nCount_RNA_raw", "nFeature_RNA_raw", "nFeature_ATAC_raw", "nCount_ATAC_raw", 
+                        "percentage_chr7_peaks", "percentage_chr7_genes", 
+                        "percentage_RB", "percentage_Malat1", "percentage_HB", 
+                        "percentage_MT", "percentage_FLT3", "percentage_t_cells",
+                        "percentage_B_cell_markers","percentage_monocytes", 
+                        "percentage_megakaryocytes", "percentage_erythroid_cells", "percentage_chrY_peaks", "percentage_chr21_peaks", "percentage_chr15_peaks")
+
+for (column in columns_to_process) {
+  new_col <- paste0(column, "_quantile_merged")
+
+  Merge_obj@meta.data <- Merge_obj@meta.data %>%
+    mutate(!!new_col := ntile(!!sym(column), 10)) %>%
+    mutate(!!new_col := case_when(
+      !!sym(new_col) == 1 ~ "Q1",
+      !!sym(new_col) == 2 ~ "Q2",
+      !!sym(new_col) == 3 ~ "Q3",
+      !!sym(new_col) == 4 ~ "Q4",
+      !!sym(new_col) == 5 ~ "Q5",
+      !!sym(new_col) == 6 ~ "Q6",
+      !!sym(new_col) == 7 ~ "Q7",
+      !!sym(new_col) == 8 ~ "Q8",
+      !!sym(new_col) == 9 ~ "Q9",
+      !!sym(new_col) == 10 ~ "Q10"
+    ))
+}
+
+Merge_obj@meta.data <- Merge_obj@meta.data %>%
+  mutate(Monosomy_cutoff =  ifelse(Merge_obj@meta.data$percentage_chr7_peaks < 3 , "Under_3", ifelse(Merge_obj@meta.data$percentage_chr7_peaks > 3.7 , "above_3.7", "3-3.7")))
+  
+  #          AML_monosomy AML_non_monosomy healthy_donors
+  # 3-3.7              871             1247            903
+  # above_3.7         7558            55257          55766
+  # Under_3          16951              205            119
+
+table(Merge_obj$Monosomy_cutoff,Merge_obj$health_condition )
+table(Merge_obj$health_condition)
+  # AML_monosomy AML_non_monosomy   healthy_donors 
+   #           25380            56709            56788 
+
+##############################
+Merge_obj$donor_main_clusters <- paste0(Merge_obj$sample_id,"_" , Merge_obj$cluster_5_main_per_sample)
+length(unique(Merge_obj$donor_main_clusters)) #113
+```
+
+# Adding cell type annotations from public dataset
+```{r}
+meta_data_22 <- Merge_obj@meta.data
+meta_data_22$barcode <- rownames(meta_data_22)
+meta_data_lueken <- read.csv(file.path(data_dir, "adata_obs.csv"))
+dim(meta_data_lueken) # 69249    29
+dim(meta_data_22) #138877    127
+colnames(meta_data_lueken)
+unique(meta_data_lueken$batch)
+unique(meta_data_22$donor)
+table(meta_data_lueken$cell_type, useNA = "ifany")
+
+# Create a mapping
+batch_mapping <- c(
+  "s1d1"  = "BMMC_S1_D1",
+  "s1d2"  = "BMMC_S1_D2",
+  "s1d3"  = "BMMC_S1_D3",
+  "s2d1"  = "BMMC_S2_D1",
+  "s2d4"  = "BMMC_S2_D4",  
+  "s2d5"  = "BMMC_S2_D5", 
+  "s3d3"  = "BMMC_S3_D3",  
+  "s3d6"  = "BMMC_S3_D6",
+  "s3d7"  = "BMMC_S3_D7",
+  "s3d10" = "BMMC_S3_D10", 
+  "s4d1"  = "BMMC_S4_D1",
+  "s4d8"  = "BMMC_S4_D8",
+  "s4d9"  = "BMMC_S4_D9"
+)
+
+meta_data_lueken <- meta_data_lueken %>%
+  mutate(donor = batch_mapping[batch])
+
+unique(meta_data_lueken$donor)
+
+rownames(meta_data_22)
+metadata <- meta_data_22
+
+# Extracting the suffix using regular expressions
+metadata <- metadata %>%
+  mutate(suffix = sub(".*-(\\d+)$", "\\1", rownames(metadata)))
+unique(metadata$suffix)
+identical(metadata$suffix, metadata$sample_id) #TRUE
+
+unique(meta_data_lueken$donor)
+unique(metadata$donor)
+
+meta_data_lueken_subset <- meta_data_lueken %>%
+ dplyr::filter(donor %in% metadata$donor)
+dim(meta_data_lueken_subset) #47137    30
+table(metadata$health_condition) #  56788 healthy
+
+unique(meta_data_lueken_subset$donor)
+
+table(metadata$donor, metadata$sample_id)
+table(meta_data_lueken_subset$donor)
+# left_join using dplyr
+meta_data_lueken_subset$donor <- unname(meta_data_lueken_subset$donor)
+
+suffix_mapping <- c(
+"BMMC_S1_D1"="26",
+"BMMC_S1_D2"="27",
+"BMMC_S1_D3"="28",
+"BMMC_S2_D1"="29",
+"BMMC_S3_D6"="34",
+"BMMC_S3_D7"="35",
+"BMMC_S4_D1"="36",
+"BMMC_S4_D8"="37",
+"BMMC_S4_D9"="38")
+
+meta_data_lueken_2 <- meta_data_lueken_subset %>%
+  mutate(suffix = suffix_mapping[donor])
+
+replace_suffix <- function(x, old_suffix, new_suffix) {
+  sub(paste0("-1-", old_suffix), new_suffix, x)
+}
+
+meta_data_lueken_2$X <- mapply(replace_suffix, meta_data_lueken_2$X, meta_data_lueken_2$suffix, paste0("-", meta_data_lueken_2$suffix))
+head(meta_data_lueken_2$X)
+unique(meta_data_lueken_2$suffix)
+
+meta_data_lueken_2$suffix <- unname(meta_data_lueken_2$suffix)
+
+meta_data_lueken_3 <- meta_data_lueken_2 %>%
+  mutate(barcode = mapply(function(x, suffix) sub("-[0-9]+-.*", paste0("-", suffix), x), X, suffix))
+head(meta_data_lueken_3$barcode)
+
+
+meta_data_lueken_3$barcode <- unname(meta_data_lueken_3$barcode)
+dim(meta_data_lueken_3) #47137    32
+
+
+meta_data_lueken_subset <- meta_data_lueken_3 %>%
+ dplyr::filter(barcode %in% metadata$barcode)
+dim(meta_data_lueken_subset) #23964    128
+dim(metadata) #115991    128
+
+merged_data <- metadata %>%
+  left_join(meta_data_lueken_subset, by = "barcode")
+
+dim(merged_data) #115991    159
+table(merged_data$cell_type)
+
+sum(is.na(merged_data$cell_type))#96982
+table(merged_data$cell_type, useNA = "ifany")
+
+ # B1 B          CD14+ Mono          CD16+ Mono    CD4+ T activated        CD4+ T naive              CD8+ T        CD8+ T naive 
+ #               1310                4915                 896                3836                3282                8758                 382 
+ #               cDC2        Erythroblast            G/M prog                 HSC ID2-hi myeloid prog                 ILC          Lymph prog 
+ #                409                2551                 519                 442                 100                 454                1016 
+ #          MK/E prog       Naive CD20+ B                  NK          Normoblast                 pDC         Plasma cell     Proerythroblast 
+ #                536                3316                4444                 878                 466                 276                1167 
+ #     Transitional B                <NA> 
+ #               1942               96982 
+ #     
+     
+rownames(merged_data) <- merged_data$barcode
+
+identical(rownames(Merge_obj@meta.data), rownames(merged_data)) #TRUE
+
+Merge_obj@meta.data$cell_type_Lucken <- merged_data$cell_type
+Merge_obj@meta.data$QCMeds_Lucken <- merged_data$QCMeds
+Merge_obj@meta.data$ATAC_pseudotime_order_Lucken <- merged_data$ATAC_pseudotime_order
+Merge_obj@meta.data$GEX_pseudotime_order_Lucken <- merged_data$GEX_pseudotime_order
+Merge_obj@meta.data$GEX_phase_Lucken <- merged_data$GEX_phase
+
+
+saveRDS(Merge_obj, file = file.path(output_dir, "03_merged_object_11AML_9healthy_2AMS_with_merged_meta_data_after_qc_all_features_included_v2.rds")) ##final
+```
+
+# Removing sample-specific features
+
+Genes and ATAC peaks from chromosomes X, Y, and 7 are removed, along with immunoglobulin/TCR 
+variable genes, haemoglobin (HB), ribosomal (RB), and mitochondrial (MT) genes, 
+as these are confounded by sample-specific biology.
+```{r features, fig.width=30, fig.height=20}
+DefaultAssay(Merge_obj) <- "RNA"
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl" )
+pages = attributePages(ensembl)
+filters = listAttributes(ensembl)
+
+#########  chrX
+chrX_genes <- getBM(
+  attributes = c('hgnc_symbol', 'chromosome_name', 'start_position','end_position'),
+  filters = 'chromosome_name',
+  values = 'X',
+  mart = ensembl
+)
+
+chrX_genes <- chrX_genes$hgnc_symbol
+length(chrX_genes) #2496
+
+########## chr Y
+chrY_genes <- getBM(
+  attributes = c('hgnc_symbol', 'chromosome_name', 'start_position','end_position'),
+  filters = 'chromosome_name',
+  values = 'Y',
+  mart = ensembl
+)
+
+chrY_genes <- chrY_genes$hgnc_symbol
+length(chrY_genes) #603
+
+######## chr7
+chr7_genes <- getBM(
+  attributes = c('hgnc_symbol', 'chromosome_name'),
+  filters = 'chromosome_name',
+  values = '7',
+  mart = ensembl
+)
+chr7_genes <- chr7_genes$hgnc_symbol
+length(chr7_genes) # 1984
+chr7_genes <- chr7_genes[chr7_genes%in%rownames(Merge_obj)]
+length(chr7_genes) # 1062
+
+
+################## 
+all_genes_name <- rownames(Merge_obj@assays$RNA)
+length(all_genes_name) #36601
+removing_genes_patterns <- "^IGHV|^IGKV|^IGLV|^TRAV|^TRBV|^TRDV|^TRGV|^HB[^(P)]|MALAT1|^RP[SL]|^IG[A-Z]*|^MT-"
+removing_genes <- grep(removing_genes_patterns, all_genes_name, value = TRUE)
+
+length(removing_genes) #726
+genes_to_remove <- unique(c(chrX_genes, chrY_genes, chr7_genes, removing_genes))
+length(genes_to_remove) #4018
+
+###############################
+
+gene_coords <- getBM(attributes = c('hgnc_symbol', 'chromosome_name', 'start_position', 'end_position'), 
+                     filters = 'hgnc_symbol', values = genes_to_remove, mart = ensembl)
+dim(gene_coords) #4539    4
+gr_genes_to_remove <- GRanges(gene_coords$chromosome_name, IRanges(gene_coords$start_position, gene_coords$end_position))
+
+seqlevelsStyle(gr_genes_to_remove) <- "UCSC"
+all_peaks <- rownames(Merge_obj@assays$ATAC)
+length(all_peaks) #184466
+atac_peaks <- StringToGRanges(all_peaks, sep = c("-", "-"))
+length(atac_peaks) #184466
+
+promoter_extension <- 100000
+
+extend_ranges <- function(ranges, strand) {
+  new_start <- ifelse(strand == "+", 
+                      start(ranges) - promoter_extension, 
+                      start(ranges))
+  new_end <- ifelse(strand == "-", 
+                    end(ranges) + promoter_extension, 
+                    end(ranges))
+
+  new_start <- pmax(new_start, 1)  # Ensure start is not less than 1
+  IRanges(new_start, new_end)
+}
+
+# Initialize a list to store extended ranges
+extended_ranges_list <- vector("list", length(gr_genes_to_remove))
+
+# Loop over the indices of gr_genes_to_remove and extend ranges
+for (i in seq_along(gr_genes_to_remove)) {
+  extended_ranges_list[[i]] <- extend_ranges(ranges(gr_genes_to_remove)[i],
+                                             strand(gr_genes_to_remove)[i])
+}
+
+# Combine the extended ranges into a single IRanges object
+combined_extended_ranges <- do.call("c", extended_ranges_list)
+length(combined_extended_ranges) #4539
+
+# Update the GRanges object with extended ranges
+gr_genes_to_remove <- GRanges(seqnames = seqnames(gr_genes_to_remove),
+                              ranges = combined_extended_ranges,
+                              strand = strand(gr_genes_to_remove))
+
+# Find overlapping peaks
+overlaps <- findOverlaps(atac_peaks, gr_genes_to_remove) 
+length(overlaps) #10161
+# Remove overlapping peaks
+filtered_atac_peaks <- atac_peaks[-queryHits(overlaps),]
+
+length(filtered_atac_peaks) #175006
+
+# Proceed the analysis using filtered_atac_peaks
+
+
+chr <- as.character(seqnames(filtered_atac_peaks))
+unique(chr)
+start <- start(filtered_atac_peaks)
+end <- end(filtered_atac_peaks)
+
+filtered_atac_peaks_strings <- paste(chr, start, end, sep = "-")
+length(intersect(filtered_atac_peaks_strings,all_peaks)) #175006
+# To filter strings that start with chrX or chrY
+residual_peaks <- filtered_atac_peaks_strings[-grep("^chrX|^chrY|^chr7", filtered_atac_peaks_strings)]
+length(residual_peaks) #170327
+# Check specific patterns individually
+matches_chrX <- grep("^chrX", filtered_atac_peaks_strings, value = TRUE)
+matches_chrY <- grep("^chrY", filtered_atac_peaks_strings, value = TRUE)
+matches_chr7 <- grep("^chr7", filtered_atac_peaks_strings, value = TRUE)
+
+print(length(matches_chrX))  # Expecting 0 based on the previous results 1759
+print(length(matches_chrY))  # Expecting 0 based on the previous results 72
+print(length(matches_chr7))  # Expecting non-zero, as it matched before 2848
+
+
+matches <- grep("^chrX|^chrY|^chr7", filtered_atac_peaks_strings)
+length(matches) #4679
+# Exclude the matches properly
+if (length(matches) > 0) {
+    residual_peaks <- filtered_atac_peaks_strings[-matches]
+} else {
+    residual_peaks <- filtered_atac_peaks_strings
+}
+
+length(residual_peaks) #170327
+length(intersect(all_genes_name,genes_to_remove)) #2708
+
+residual_genes <- all_genes_name[!all_genes_name %in% genes_to_remove]
+length(residual_genes) #33893
+
+residual_features <- c(residual_peaks, residual_genes)
+length(residual_features) #204220
+Merge_obj #221067 features across 138877 samples within 2 assays 
+Merge_obj <- subset(Merge_obj, features = residual_features) #204220 features across 138877 samples within 2 assays 
+saveRDS(Merge_obj, file = file.path(output_dir, "03_merged_object_11AML_9healthy_2AMS_with_merged_meta_data_after_qc_filtered_features_ch7_removed.rds")) #final
+```
+
+
+

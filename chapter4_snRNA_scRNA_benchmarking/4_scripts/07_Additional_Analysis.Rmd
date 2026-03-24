@@ -1,0 +1,986 @@
+---
+title: "07_Additional_Analysis"
+author: "Reza Ghamsari"
+date: "2025-05-19"
+output: html_document
+---
+# Script Overview
+This R Markdown document performs additional analyses on single-cell and single-nucleus RNA-seq data, focusing on:
+
+Quality control visualization and assessment
+Highly Variable Gene (HVG) identification and comparison between platforms
+Gene length and GC content distribution analysis
+Platform-specific technical bias characterization
+```{r setup, include=FALSE}
+all_times <- list()  # store the time for each chunk
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now)
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  time_it = TRUE
+)
+```
+
+# Define Color Schemes and File Paths
+```{r, colors}
+# Custom color palette for consistent visualization
+my_colors <- unique(c(
+  "#802268FF", "#006400", "#525ecc99", "#1f0fdf99", "#480607", "#D55E00", 
+  "#164194FF", "#7E6148FF", "#ADB6B6FF", "#52a7cc99", "#F0E685FF", "#cc52c099", 
+  "#6acc5299", "#DC143C", "#802268FF", "#ffbb78", "#3C548899", "#189b3699", 
+  "#cc9b5299", "#1f0fdf99", "#ccebc5", "#42857599", "#868686FF", "#006400", 
+  "#0A47FFFF", "#3B1B53FF", "#749B58FF", "#ccc05299", "#cc765299", "#1B1919FF", 
+  "#00D68FFF", "#14FFB1FF", "#3C5488FF", "#8F7700FF", "#164194FF", "#0094CDFF", 
+  "#FFDAB9", "#FF00FF", "#00FFFF", "green", "blue", "#480607"
+))
+
+# Define the directory to save the PDF files
+rds_path_vst <- "/vast/projects/aml_multiome/Sn_vs_SC/rds_path_vst/"
+fig_path_stnx <- "/home/users/allstaff/ghamsari.r/seurat_figures/Sn_vs_SC_V4/"
+
+```
+
+
+
+# Loading Packages
+```{r, pkgs}
+script_title <- "06_02_EdgeR_pseudo_bulk_Analysis"
+pkgs <- c("Signac", "Seurat", "BiocParallel", "DESeq2", "gridExtra", "parallel", "edgeR", "RColorBrewer", "patchwork", 
+"limma", "tibble", "openxlsx", "ggplot2", "reshape2", "dplyr", "grid", "tidyverse", "htmlwidgets", "cowplot", "stringr", 
+"tidyr", "pheatmap", "ggrepel" , "future" , "future.apply", "UpSetR" , "introdataviz")
+
+# Load all packages silently
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# Save session information for reproducibility
+sink(file.path(fig_path_stnx, paste0(script_title, "_sessionInfo.txt")))
+sessionInfo()
+sink()
+```
+
+
+
+
+# Reading data
+```{r, reading objects}
+merged_obj <- readRDS(paste0(rds_path_vst, "05_Merge_object_cell_types_annotated_clustered_list_22_samples_11sn_11sc.rds"))  #36601 features across 172055 samples
+merged_obj_v0 <- merged_obj
+merged_obj_list<- SplitObject(merged_obj, split.by = "sample_id")
+```
+# Quality Control Analysis
+
+Scatter Plot Visualization by Cell Type: Examine QC metrics patterns across different cell types to identify platform-specific biases, particularly in erythroid populations 
+
+```{r, scatter plot and MAD }
+###made this plot to re-check the plot 04_scatter_plots_visualisation_all_cells_before_subsetting_MAD_6 and see which cells are responsible for seeing two trend in scRNAseq.
+scatter_features <- list(
+  c("nCount_RNA", "nFeature_RNA"),     # Total counts vs unique genes
+  c("percent.mt", "percent.malat1")    # Mitochondrial vs MALAT1 percentage
+)
+
+
+ 
+# Function to create scatter plots colored by cell type
+create_plot <- function(features, sobj, sample_id) {
+  # Extract the actual feature values
+  x_feature <- features[1]
+  y_feature <- features[2]
+  # Prepare data frame for plotting
+  plot_df <- data.frame(
+    x = sobj@meta.data[[x_feature]],
+    y = sobj@meta.data[[y_feature]],
+    cell_type = as.factor(sobj@meta.data[["cell_type_fine"]]),
+    Donor = as.factor(sobj@meta.data[["sample_id"]]),
+    colors_cell_type = sobj@meta.data[["colors_cell_type_fine"]]
+  )
+  
+  # Build color mapping from cell type to its color
+
+  color_mapping <- setNames(levels(plot_df$colors_cell_type ),levels(plot_df$cell_type))
+  
+  # Generate scatter plot 
+  scatter_plot <- ggplot(plot_df, aes(x = x, y = y, color = cell_type)) +
+    geom_point(alpha = 0.8, size = 0.9) +
+    scale_color_manual(
+      values = color_mapping,
+      guide = guide_legend(override.aes = list(size = 9, alpha = 1))
+    ) +
+    labs(
+      title = paste(sample_id),
+      x = x_feature,
+      y = y_feature,
+      color = "Cell Type"
+    ) +
+    theme_minimal() +
+    theme(panel.background = element_rect(fill = "white"),
+      panel.grid = element_blank(),
+      plot.title = element_text(hjust = 0.5)
+    )
+
+  return(scatter_plot)
+}
+
+
+
+
+# Generate comprehensive QC plots for all samples
+pdf(file = paste0(fig_path_stnx, "07_scatter_qc_plot_color_by_cell_type_fine_per_sample_split.pdf"), width = 14, height = 7)
+
+# Loop over all samples
+for (sample_id in names(merged_obj_list)) {
+  
+  # Extract the current sample object
+  sobj <- merged_obj_list[[sample_id]]
+  
+  # Create a list to store the plots for the current sample
+  plots <- list()
+  
+  # Loop over all feature pairs
+  for (features in scatter_features) {
+    
+    # Create the plot for the current feature pair
+    plot <- create_plot(features, sobj, sample_id)
+    
+    # Add the plot to the list
+    plots[[length(plots) + 1]] <- plot
+  }
+  
+  # Arrange and display the plots on one page
+  grid.arrange(grobs = plots, ncol = 2)
+}
+
+dev.off()
+#!!scRNA-seq shows two distinct trends in erythroblast populations
+```
+# Highly Variable Gene (HVG) Analysis
+HVG Identification Using Multiple Methods
+Purpose: Compare HVG identification between SCTransform and variance stabilizing transformation (VST) methods across methodologies (platforms)
+ to assess method robustness and platform effects.
+
+
+```{r, clustering}
+# To identify the number of available cores
+num_cores <- parallelly::availableCores() #56
+plan(multisession, workers = num_cores - 4)
+
+#============================================== HVGs Sctransform ===============================================================
+processSeurat <- function(x) {
+  x <- SCTransform (x, vst.flavor = "v2", verbose = FALSE,new.assay.name = "SCT_v2", seed.use = 1448145, variable.features.n = 3000)
+  hvgs <-   x@assays$SCT_v2@var.features
+    return(hvgs)
+}
+# Generate HVGs for individual samples using SCTransform
+HVG_list_sct <- future_lapply(merged_obj_list, processSeurat, future.seed = TRUE)
+saveRDS(HVG_list_sct, paste0(rds_path_vst, "07_HVG_list_sct_v2_3000.rds"))
+# HVG_list_sct <- readRDS(paste0(rds_path_vst, "07_HVG_list_sct_v2_3000.rds"))
+#========================================
+# Generate HVGs for merged object using SCTransform
+merged_obj_sct <- SCTransform (merged_obj, vst.flavor = "v2", verbose = FALSE,new.assay.name = "SCT_v2", seed.use = 1448145, variable.features.n = 3000)
+merge_hvgs_sct <-   merged_obj_sct@assays$SCT_v2@var.features
+saveRDS(merge_hvgs_sct, paste0(rds_path_vst, "07_HVG_merged_obj_sct_v2_3000.rds"))
+# merge_hvgs_sct <- readRDS(paste0(rds_path_vst, "07_HVG_merged_obj_sct_v2_3000.rds"))
+
+#==================================================HVGs VST seurat Default==============================================
+processSeurat <- function(x) {
+    x <- NormalizeData(x, assay="RNA")
+    x <- FindVariableFeatures(x, selection.method = "vst", nfeatures= 3000, assay="RNA")
+    hvg_vst <- VariableFeatures(x[["RNA"]])
+    return(hvg_vst)
+}
+# Generate HVGs for individual samples using VST
+HVG_list_vst <- future_lapply(merged_obj_list, processSeurat, future.seed = TRUE)
+saveRDS(HVG_list_vst, paste0(rds_path_vst, "07_HVG_list_vst_3000.rds"))
+# HVG_list_vst <- readRDS(paste0(rds_path_vst, "07_HVG_list_vst_3000.rds"))
+# Generate HVGs for merged object using VST
+merged_obj <- merged_obj_v0 #36601 features across 172055 samples
+merged_obj <- NormalizeData(merged_obj, assay="RNA")
+merged_obj<- FindVariableFeatures(merged_obj, selection.method = "vst", nfeatures= 3000, assay="RNA")
+merge_hvgs_vst <- VariableFeatures(merged_obj[["RNA"]])
+saveRDS(merge_hvgs_vst, paste0(rds_path_vst, "07_HVG_merged_obj_vst_3000.rds"))
+# merge_hvgs_vst <- readRDS(paste0(rds_path_vst, "07_HVG_merged_obj_vst_3000.rds"))
+
+```
+## Intra-Platform HVG Consistency Analysis
+Assess the robustness of HVG identification within each platform using Jaccard similarity indices.
+
+```{r}
+# pdf(file = paste0(fig_path_stnx, "07_Jaccard_split_violin_HVGs_3000_SCT.pdf"), width = 12, height = 16)
+# HVG_list <- readRDS(paste0(rds_path_vst, "07_HVG_list_sct_v2_3000.rds"))
+# pdf(file = paste0(fig_path_stnx, "07_Jaccard_split_violin_HVGs_3000_VST.pdf"), width = 12, height = 16)
+# HVG_list <- readRDS(paste0(rds_path_vst, "07_HVG_list_vst_3000.rds"))
+
+# Separate samples by platform
+sc_HVGs <- HVG_list[grep("_cell", names(HVG_list))]
+sn_HVGs <- HVG_list[grep("_Nuclei", names(HVG_list))]
+
+# Function to calculate pairwise Jaccard similarities within a group
+get_jaccard_distribution <- function(hvg_list) {
+  n <- length(hvg_list)
+  jaccard_values <- c()
+  for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
+      jaccard <- length(intersect(hvg_list[[i]], hvg_list[[j]])) /
+                 length(union(hvg_list[[i]], hvg_list[[j]]))
+      jaccard_values <- c(jaccard_values, jaccard)
+    }
+  }
+  return(jaccard_values)
+}
+# Calculate Jaccard distributions for each platform
+sc_jaccards <- get_jaccard_distribution(sc_HVGs)
+sn_jaccards <- get_jaccard_distribution(sn_HVGs)
+
+
+# Prepare data for visualization
+boxplot_data <- list(scRNAseq = sc_jaccards, snRNAseq = sn_jaccards)
+
+
+# Convert list to dataframe for ggplot
+
+df <- data.frame(
+  Jaccard = c(boxplot_data$scRNAseq, boxplot_data$snRNAseq),
+  Platform = rep(c("scRNAseq", "snRNAseq"),
+                 times = c(length(boxplot_data$scRNAseq), length(boxplot_data$snRNAseq)))
+)
+
+ggplot(df, aes(x = Platform, y = Jaccard, fill = Platform)) +
+  geom_violin(trim = FALSE, alpha = 0.3, color = NA) +
+
+  geom_jitter(width = 0.05, size = 1.5, alpha = 0.7) + 
+  stat_summary(fun.data = mean_se, geom = "crossbar", show.legend = TRUE,
+               width = 0.3, color = "black", fatten = 2) +  # mean ± SE bars
+  scale_fill_manual(values = c("scRNAseq" = "#6699CC", "snRNAseq" = "#CC6677")) +
+  theme_minimal() +
+  labs(title = "Intra-platform HVG Consistency",
+       y = "Jaccard Index (HVG Overlap)",
+       x = "") +
+theme(
+  axis.line = element_line(color = "black"),  # add axis lines
+  axis.ticks = element_line(color = "black"), # add ticks
+    legend.position = "none",
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    panel.grid = element_blank(),        # remove all grid lines
+    panel.border = element_blank()      # remove panel border if any
+  )
+
+
+
+####################################### split violin plot
+# Add fixed x for violin center
+df <- df %>%
+  mutate(
+    x = 0,
+    # Custom x offsets: left half for scRNAseq, right half for snRNAseq
+    x_jitter = case_when(
+      Platform == "scRNAseq" ~ -0.03,
+      Platform == "snRNAseq" ~ 0.03
+    ),
+    x_summary = case_when(
+      Platform == "scRNAseq" ~ -0.02,
+      Platform == "snRNAseq" ~ 0.02
+    )
+  )
+
+ggplot(df, aes(x = x, y = Jaccard, fill = Platform)) +
+  geom_split_violin(alpha = 0.3, trim = FALSE, color = "transparent", width = 0.8, show.legend = TRUE) +
+  
+  # Points jittered and nudged left/right per Platform
+  geom_point(aes(x = x_jitter, color = Platform), size = 0.1, alpha = 0.7, position = position_jitter(width = 0)) +
+    geom_boxplot(aes(x = x_jitter, fill = Platform), width = 0.025, alpha = 0.4, size = 0.05, fatten = NULL, show.legend = TRUE, outlier.size = 0.5, color = "white",
+                   outlier.color = "gray", outlier.alpha = 0.6) +
+
+  stat_summary(aes(x = x_jitter, color = Platform), fun.data = mean_se, geom = "pointrange",
+               width = 0.9,  fatten = 5,
+               position = position_identity()) +
+  
+scale_fill_manual(values = c("scRNAseq" = "#6699CC", "snRNAseq" = "#CC6677")) +
+  scale_color_manual(values = c("scRNAseq" = "#00468B", "snRNAseq" = "#8B0046")) +  
+    scale_y_continuous(
+    breaks = seq(0, 1, by = 0.1),
+    limits = c(0, 1)
+  ) +
+  
+  labs(
+    title = "Intra-platform HVG Consistency",
+    x = "", 
+    y = "Jaccard Index (HVG Overlap)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black"),
+    axis.text.y = element_text(size = 12, color = "black"),
+    axis.title = element_text(size = 14),
+    legend.position = "top",
+    panel.grid = element_blank(),
+    panel.border = element_blank()
+  )
+
+dev.off()
+```
+## HVG Similarity Heatmap Analysis
+Purpose: Visualize sample-to-sample HVG similarities using hierarchical clustering to identify platform and batch effects.
+
+#jaccard heatmap
+```{r, fig.width=10}
+# Load HVG data and add merged object HVGs
+#========================= variance stabilizing transform
+HVG_list <- readRDS(paste0(rds_path_vst, "07_HVG_list_vst_3000.rds"))
+merge_hvgs_vst <- readRDS(paste0(rds_path_vst, "07_HVG_merged_obj_vst_3000.rds"))
+HVG_list[["ALL_ALL_Merged"]] <- merge_hvgs_vst
+pdf_file <- paste0(fig_path_stnx, "07_Jaccard_heatmap_HVGs_3000_vst_v_final.pdf")
+main_title <-  "Jaccard (ward.D2) of HVGs VST"
+
+
+#=========================. ScTransform
+# HVG_list <- readRDS(paste0(rds_path_vst, "07_HVG_list_sct_v2_3000.rds"))
+# merge_hvgs_sct <- readRDS(paste0(rds_path_vst, "07_HVG_merged_obj_sct_v2_3000.rds"))
+# HVG_list[["ALL_ALL_Merged"]] <- merge_hvgs_sct
+# pdf_file <- paste0(fig_path_stnx, "07_Jaccard_heatmap_HVGs_3000_SCT_v_final.pdf")
+# main_title <-  "Jaccard (ward.D2) of HVGs SCT"
+
+
+#========================= Function to calculate full Jaccard similarity matrix
+# All pairwise Jaccard within a group
+names(HVG_list)
+
+get_jaccard_matrix <- function(hvg_list) {
+  n <- length(hvg_list)
+  mat <- matrix(NA, n, n, dimnames = list(names(hvg_list), names(hvg_list)))
+ for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
+      mat[i, j] <- length(intersect(hvg_list[[i]], hvg_list[[j]])) / 
+                   length(union(hvg_list[[i]], hvg_list[[j]]))
+    }
+ }
+
+  return(mat)
+}
+
+# Calculate Jaccard similarity matrix
+mtx_jaccards <- get_jaccard_matrix(HVG_list)
+
+# Convert upper triangle to full symmetric matrix
+mtx_jaccards[lower.tri(mtx_jaccards)] <- t(mtx_jaccards)[lower.tri(mtx_jaccards)]
+
+# Define annotation colors
+my_annotation_colors <- list(
+  Method = c(cell = "#6699CC", Nuclei = "#CC6677", Merged ="white"),
+  Site = c(S1 = "#661100", S2 = "#888888", S3 = "#008B45", S4 = "#D55E00", ALL= "white" ),
+  Donor = c(D1 = "#00A087FF", D2 = "#4A0F5FFF", D3 = "#00468B", D4 = "#BB0021FF",
+            D5 = "#006400", D6 = "#08306B", D7 = "#ffbb78", D8 = "#8da0cb",
+            D9 = "#e78ac3", ALL= "white")
+)
+
+# Create sample metadata for annotations
+meta <- data.frame(Sample = rownames(mtx_jaccards)) %>%
+  separate(Sample, into = c("Site", "Donor", "Method"), sep = "_",  remove = FALSE)
+
+# Use as annotation row/column with reordered columns
+annotation_col <- meta %>%
+  select(Sample, Method) %>%  # re-order columns
+  column_to_rownames("Sample")
+
+annotation_row <- meta %>%
+  select(Sample, Site, Donor) %>%  # re-order columns
+  column_to_rownames("Sample")
+
+# Perform clustering using Ward.D2 method on MDS-embedded distances
+dist_jaccard <- as.dist(1 - mtx_jaccards)
+
+# Embed into Euclidean space
+mds_coords <- cmdscale(dist_jaccard, k = 16) #Classical Multidimensional Scaling (MDS) to embed the samples into a Euclidean space to approximate non-Euclidean distances (like Jaccard)
+
+# Compute Euclidean distances on embedded data
+dist_euc <- dist(mds_coords)
+
+# Ward.D2 clustering on Euclidean distances
+hc_ward <- hclust(dist_euc, method = "ward.D2")
+
+# Generate heatmap
+pdf(pdf_file, width = 7, height = 6)
+color_vector <- c("white", "#737373")
+# Plot
+fontsize = 9
+
+# Use hc_ward in heatmap
+pheatmap(mtx_jaccards,
+         cluster_rows = hc_ward,
+         cluster_cols = hc_ward,
+         clustering_distance_rows = NULL,
+         clustering_distance_cols = NULL,
+         clustering_method = NULL,
+         annotation_col = annotation_col,
+         annotation_row = annotation_row,
+         annotation_colors = my_annotation_colors,
+         fontsize_row = fontsize,
+         fontsize_col = fontsize,
+         main = main_title,
+         color = colorRampPalette(color_vector)(400),
+         treeheight_col = 30,
+         treeheight_row = 0)
+
+dev.off()
+
+
+##uncomment for scTransform
+
+# pheatmap(mtx_jaccards,
+#          clustering_distance_rows = dist_jaccard,
+# clustering_distance_cols = dist_jaccard,
+#          clustering_method = "average",
+#           cluster_rows = TRUE,
+#          cluster_cols = TRUE,
+#          annotation_col = annotation_col,
+#          annotation_row = annotation_row,
+#         annotation_colors = my_annotation_colors,
+#          main = "Jaccard Similarity of HVGs (variance stabilizing transform/average clustering)",
+#    # main = "Jaccard Similarity of HVGs (scTransform/average clustering)",
+# 
+#         color = colorRampPalette(color_vector))(100),
+#   treeheight_row = 0,
+#          treeheight_col = 0
+# )
+
+
+```
+
+# Gene Length Distribution Analysis
+Examine how gene length affects count distribution between scRNA-seq and snRNA-seq platforms.
+```{r, final}
+merged_obj <- merged_obj_v0 #36601 features across 172055 samples
+merged_obj_list<- SplitObject(merged_obj, split.by = "sample_id")
+
+############ Define the gene length categories
+
+for (obj in names(merged_obj_list)){
+  sobj <- merged_obj_list[[obj]]
+  # Step 1: Get the gene row sums across all barcodes (total count per gene)
+  count_matrix <- sobj@assays$RNA$counts
+  nCount_per_gene <- rowSums(count_matrix)
+ if(identical(names(nCount_per_gene), rownames(sobj))) {#TRUE
+ sobj@assays$RNA@meta.data$nCount_per_gene <- nCount_per_gene}
+  merged_obj_list[[obj]] <- sobj
+}
+# Analyze gene length distribution across samples
+all_counts <- list()
+
+for (obj in names(merged_obj_list)) {
+  sobj <- merged_obj_list[[obj]]
+  platform <- unique(sobj$Platform)
+  Site <- unique(sobj$Site)
+  Donor <- unique(sobj$Donor)
+  Donor_Site <- unique(sobj$Donor_Site)
+  gene_df <- sobj@assays$RNA@meta.data
+  gene_df <- gene_df[!is.na(gene_df$gene_length), ]
+
+  gene_df <- gene_df %>%
+  arrange(gene_length)
+  dens <- density(gene_df$gene_length, na.rm = TRUE)
+# # Plot it to inspect
+#  plot(dens, main = "Density Estimate of Gene Lengths")
+# abline(v = median(gene_df$gene_length), col = "red", lty = 2)  # Add the raw data median
+
+  # Create gene length bins (50 quantile-based bins)
+  gene_df$length_bin <- cut(
+    gene_df$gene_length,
+    breaks = quantile(gene_df$gene_length, probs = seq(0, 1, length.out = 50)),
+    include.lowest = TRUE
+  )
+# Calculate counts per bin
+  counts_by_bin <- gene_df %>%
+  group_by(length_bin) %>%
+  summarise(
+    total_counts = sum(nCount_per_gene),
+    gene_number = n()
+  ) %>%
+  mutate(
+    platform = platform,
+    Donor = Donor,
+    Site = Site,
+    Donor_Site = Donor_Site,
+    Site_platform = paste0(Site, "_", platform),
+    Sample_id = obj
+  )
+table(counts_by_bin$gene_number)
+  all_counts[[obj]] <- counts_by_bin
+}
+
+# Combine all into one dataframe
+combined_df <- bind_rows(all_counts)
+
+
+# Extract bin midpoints for plotting
+scientific_num_pattern <- "[0-9\\.eE\\+\\-]+"
+combined_df <- combined_df %>%
+  mutate(
+    bin_start = as.numeric(str_extract(length_bin, paste0("(?<=\\[|\\()", scientific_num_pattern))),
+    bin_end = as.numeric(str_extract(length_bin, paste0("(?<=,)", scientific_num_pattern, "(?=\\]|\\))"))),
+    bin_mid = (bin_start + bin_end) / 2
+  )
+
+combined_df$bin_mid_factor <- factor(combined_df$bin_mid)
+
+combined_df <- combined_df %>%
+  group_by(Sample_id) %>%
+  mutate(
+    total_counts_per_sample = sum(total_counts),  # Total counts for the entire sample
+    # Normalize within each sample and calculate percentage of total counts per bin
+    percentage_bin_count = (total_counts / total_counts_per_sample) * 100
+  ) %>%
+  ungroup()
+
+# Create visualization
+pdf(file = paste0(fig_path_stnx, "07_Distribution_gene_length_v2.pdf"), width = 8, height = 5)
+ggplot(combined_df, aes(x = bin_mid_factor, y = percentage_bin_count, color = platform, group = Sample_id)) +
+  geom_line(size = 0.5, alpha = 0.5) +
+  labs(
+    title = "Percentage of Counts per Gene-Length-Bin per sample Across 11 Paired Samples \n 50 bins ~720 genes per bin",
+    x = "Gene Length Bin Midpoint (bp)",
+    y = "Counts per Bin / per sample *100",
+    color = "Sample"
+  ) +
+  scale_color_manual(values = c("scRNA" = "#00468B", "snRNA" = "#8B0046")) +
+  scale_x_discrete(breaks = levels(combined_df$bin_mid_factor)[seq(1, length(levels(combined_df$bin_mid_factor)), by = 2)])+
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+     axis.line = element_line(color = "black"),
+    plot.title = element_text(size = 8)
+  )
+
+dev.off()
+```
+
+## GC Content Distribution Analysis
+Analyze GC content bias between platforms, as GC-rich regions may be differentially accessible to nuclear vs cellular extraction methods.
+
+```{r, final}
+merged_obj <- merged_obj_v0 #36601 features across 172055 samples
+merged_obj_list<- SplitObject(merged_obj, split.by = "sample_id")
+
+############ Define the gene GC-Percentage categories
+
+
+for (obj in names(merged_obj_list)){
+  sobj <- merged_obj_list[[obj]]
+  # Step 1: Get the gene row sums across all barcodes (total count per gene)
+  count_matrix <- sobj@assays$RNA$counts
+  nCount_per_gene <- rowSums(count_matrix)
+ if(identical(names(nCount_per_gene), rownames(sobj))) {#TRUE
+ sobj@assays$RNA@meta.data$nCount_per_gene <- nCount_per_gene}
+  merged_obj_list[[obj]] <- sobj
+}
+
+all_counts <- list()
+
+for (obj in names(merged_obj_list)) {
+  sobj <- merged_obj_list[[obj]]
+  platform <- unique(sobj$Platform)
+  Site <- unique(sobj$Site)
+  Donor <- unique(sobj$Donor)
+  Donor_Site <- unique(sobj$Donor_Site)
+  gene_df <- sobj@assays$RNA@meta.data
+  gene_df <- gene_df[!is.na(gene_df$percentage_gene_gc_content), ]
+  gene_df <- gene_df %>%
+  arrange(percentage_gene_gc_content)
+  dens <- density(gene_df$percentage_gene_gc_content, na.rm = TRUE)
+# 
+# # Plot it to inspect
+#  plot(dens, main = "Density Estimate of Gene GC percentage")
+# abline(v = median(gene_df$percentage_gene_gc_content), col = "red", lty = 2)  # Add the raw data median
+
+  # Create bins - use fewer bins for clarity, e.g. 100
+  gene_df$GC_bin <- cut(
+    gene_df$percentage_gene_gc_content,
+    breaks = quantile(gene_df$percentage_gene_gc_content, probs = seq(0, 1, length.out = 100)),
+    include.lowest = TRUE
+  )
+
+  counts_by_bin <- gene_df %>%
+  group_by(GC_bin) %>%
+  summarise(
+    total_counts = sum(nCount_per_gene),
+    gene_number = n()
+  ) %>%
+  mutate(
+    platform = platform,
+    Donor = Donor,
+    Site = Site,
+    Donor_Site = Donor_Site,
+    Site_platform = paste0(Site, "_", platform),
+    Sample_id = obj
+  )
+  all_counts[[obj]] <- counts_by_bin
+}
+
+# Combine all into one dataframe
+combined_df <- bind_rows(all_counts)
+
+
+
+scientific_num_pattern <- "[0-9\\.eE\\+\\-]+"
+combined_df <- combined_df %>%
+  mutate(
+    bin_start = as.numeric(str_extract(GC_bin, paste0("(?<=\\[|\\()", scientific_num_pattern))),
+    bin_end = as.numeric(str_extract(GC_bin, paste0("(?<=,)", scientific_num_pattern, "(?=\\]|\\))"))),
+    bin_mid = (bin_start + bin_end) / 2
+  )
+
+combined_df$bin_mid_factor <- factor(combined_df$bin_mid)
+
+combined_df <- combined_df %>%
+  group_by(Sample_id) %>%
+  mutate(
+    total_counts_per_sample = sum(total_counts),  # Total counts for the entire sample
+    # Normalize within each sample and calculate percentage of total counts per bin
+    percentage_bin_count = (total_counts / total_counts_per_sample) * 100
+  ) %>%
+  ungroup()
+
+
+
+pdf(file = paste0(fig_path_stnx, "07_Distribution_percentage_gene_gc_content_v2.pdf"), width = 8, height = 5)
+ggplot(combined_df, aes(x = bin_mid_factor, y = percentage_bin_count, color = platform, group = Sample_id)) +
+  geom_line(size = 0.5, alpha = 0.5) +
+  labs(
+    title = "Percentage of Counts per GC-Percentage-Bin per sample Across 11 Paired Samples \n 50 bins ~720 genes per bin",
+    x = "Gene GC-Percentage Bin Midpoint (bp)",
+    y = "Percentage Counts per Bin per sample",
+    color = "Sample"
+  ) +
+  scale_color_manual(values = c("scRNA" = "#00468B", "snRNA" = "#8B0046")) +
+  scale_x_discrete(breaks = levels(combined_df$bin_mid_factor)[seq(1, length(levels(combined_df$bin_mid_factor)), by = 4)])+
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+     axis.line = element_line(color = "black")
+  )
+
+
+dev.off()
+
+```
+
+### Finding the genes with high percentage in length bins
+```{r, }
+obj <- "S1_D1_cell"
+
+for (obj in names(merged_obj_list_Sub)){
+ sobj <- merged_obj_list_Sub[[obj]]
+  # Step 1: Get the gene row sums across all barcodes (total count per gene)
+  count_matrix <- sobj@assays$RNA$counts
+  nCount_per_gene <- rowSums(count_matrix)
+  lib_size <- sum(nCount_per_gene)
+  nCount_per_gene_cpm <- nCount_per_gene/lib_size*1000000
+ if(identical(names(nCount_per_gene), rownames(sobj))) {#TRUE
+ sobj@assays$RNA@meta.data$nCount_per_gene <- nCount_per_gene
+ sobj@assays$RNA@meta.data$nCount_per_gene_cpm <- nCount_per_gene_cpm}
+  platform <- unique(sobj$Platform)
+  Site <- unique(sobj$Site)
+  Donor <- unique(sobj$Donor)
+  Donor_Site <- unique(sobj$Donor_Site)
+  gene_df <- sobj@assays$RNA@meta.data
+  gene_df <- gene_df[!is.na(gene_df$gene_length), ]
+  gene_df <- gene_df %>%
+  arrange(gene_length)
+  # Create bins - use fewer bins for clarity, e.g. 100
+  gene_df$length_bin <- cut(
+    gene_df$gene_length,
+    breaks = quantile(gene_df$gene_length, probs = seq(0, 1, length.out = 50)),
+    include.lowest = TRUE
+  )
+
+  counts_by_bin <- gene_df %>%
+  group_by(length_bin) %>%
+  summarise(
+    total_counts = sum(nCount_per_gene),
+    gene_number = n()
+  ) %>%
+  mutate(
+    platform = platform,
+    Donor = Donor,
+    Site = Site,
+    Donor_Site = Donor_Site,
+    Site_platform = paste0(Site, "_", platform),
+    Sample_id = obj
+  )
+
+
+# Combine all into one dataframe
+combined_df <- counts_by_bin
+
+combined_df <- combined_df %>%
+  mutate(
+    total_counts_per_sample = sum(total_counts),  # Total counts for the entire sample
+    # Normalize within each sample and calculate percentage of total counts per bin
+    percentage_bin_count = (total_counts / total_counts_per_sample) * 100
+  ) 
+# Sort the combined_df by percentage_bin_count in descending order
+arranged_combined_df_descending <- combined_df %>%
+  arrange(desc(percentage_bin_count))
+
+# View the result
+head(arranged_combined_df_descending)
+
+# Find the bin with the highest percentage (from previous steps)
+# highest_percentage_bin <- combined_df %>%
+#   filter(percentage_bin_count == max(percentage_bin_count, na.rm = TRUE))
+highest_percentage_bin <- combined_df %>%
+  filter(percentage_bin_count >4 )
+highest_percentage_bin$percentage_bin_count
+# Get the length_bin of the bin with the highest percentage
+highest_bin <- highest_percentage_bin$length_bin
+
+
+for (bin in highest_bin) {
+# Filter gene_df to find genes in the bin with the highest percentage
+genes_in_highest_bin <- gene_df %>%
+  filter(length_bin == bin)
+
+arranged_genes_in_highest_bin <- genes_in_highest_bin %>%
+  arrange(desc(nCount_per_gene))
+print(paste0("Top genes in bin ", bin, " for sample ", obj, ": ", 
+             paste(arranged_genes_in_highest_bin$hgnc_symbol[1:3], collapse = ", ")," CPM= ", paste(arranged_genes_in_highest_bin$nCount_per_gene_cpm[1:3], collapse = ", ")))
+
+}}
+
+# Filter gene_df to find the gene with hgnc_symbol "HBA2"
+hba2_gene <- gene_df %>%
+  filter(hgnc_symbol == "HBA2")
+```
+### Removing peaks in the first plot and re-visualization
+#### Gene length visualization after filtering some genes like HBs and RPs
+
+```{r, length}
+merged_obj <- merged_obj_v0 #36601 features across 172055 samples
+all_genes_name <- rownames(merged_obj@assays$RNA)
+removing_genes_patterns <- "^HB[^(P)]|^RP[SL]|^MT-|MALAT1"
+# removing_genes_patterns <- "^IGHV|^IGKV|^IGLV|^TRAV|^TRBV|^TRDV|^TRGV|^HB[^(P)]|MALAT1|^RP[SL]|^IG[HKL][A-Z0-9-]*|^MT-"
+removing_genes <- grep(removing_genes_patterns, all_genes_name, value = TRUE)
+length(removing_genes) #128
+residual_genes <- all_genes_name[!all_genes_name %in% removing_genes]
+length(residual_genes) #36473
+
+merged_obj_sub <- subset(merged_obj, features = residual_genes) #34920 features across 172055 samples within 1 assay
+
+merged_obj_list_Sub<- SplitObject(merged_obj_sub, split.by = "sample_id")
+
+# #############
+############ Define the gene length categories
+#############
+
+all_counts <- list()
+for (obj in names(merged_obj_list_Sub)){
+  sobj <- merged_obj_list_Sub[[obj]]
+  # Step 1: Get the gene row sums across all barcodes (total count per gene)
+  count_matrix <- sobj@assays$RNA$counts
+  nCount_per_gene <- rowSums(count_matrix)
+ if(identical(names(nCount_per_gene), rownames(sobj))) {#TRUE
+ sobj@assays$RNA@meta.data$nCount_per_gene <- nCount_per_gene}
+  platform <- unique(sobj$Platform)
+  Site <- unique(sobj$Site)
+  Donor <- unique(sobj$Donor)
+  Donor_Site <- unique(sobj$Donor_Site)
+  gene_df <- sobj@assays$RNA@meta.data
+  gene_df <- gene_df[!is.na(gene_df$gene_length), ]
+
+ gene_df <- gene_df %>%
+  arrange(gene_length)
+  # Create bins - use fewer bins for clarity, e.g. 100
+  gene_df$length_bin <- cut(
+    gene_df$gene_length,
+    breaks = quantile(gene_df$gene_length, probs = seq(0, 1, length.out = 50)),
+    include.lowest = TRUE
+  )
+
+  counts_by_bin <- gene_df %>%
+  group_by(length_bin) %>%
+  summarise(
+    total_counts = sum(nCount_per_gene),
+    gene_number = n()
+  ) %>%
+  mutate(
+    platform = platform,
+    Donor = Donor,
+    Site = Site,
+    Donor_Site = Donor_Site,
+    Site_platform = paste0(Site, "_", platform),
+    Sample_id = obj
+  )
+
+  all_counts[[obj]] <- counts_by_bin
+}
+
+# Combine all into one dataframe
+combined_df <- bind_rows(all_counts)
+
+
+
+scientific_num_pattern <- "[0-9\\.eE\\+\\-]+"
+combined_df <- combined_df %>%
+  mutate(
+    bin_start = as.numeric(str_extract(length_bin, paste0("(?<=\\[|\\()", scientific_num_pattern))),
+    bin_end = as.numeric(str_extract(length_bin, paste0("(?<=,)", scientific_num_pattern, "(?=\\]|\\))"))),
+    bin_mid = (bin_start + bin_end) / 2
+  )
+
+combined_df$bin_mid_factor <- factor(combined_df$bin_mid)
+
+combined_df <- combined_df %>%
+  group_by(Sample_id) %>%
+  mutate(
+    total_counts_per_sample = sum(total_counts),  # Total counts for the entire sample
+    # Normalize within each sample and calculate percentage of total counts per bin
+    percentage_bin_count = (total_counts / total_counts_per_sample) * 100
+  ) %>%
+  ungroup()
+
+
+
+pdf(file = paste0(fig_path_stnx, "07_Distribution_gene_length_HB_RB_Removed_v3.pdf"), width = 8, height = 5)
+ggplot(combined_df, aes(x = bin_mid_factor, y = percentage_bin_count, color = platform, group = Sample_id)) +
+  geom_line(size = 0.5, alpha = 0.5) +
+  labs(
+    title = "Percentage of Counts per Gene Length Bin Across 11 Paired Samples \n MTs, RBs, HBs and Malat1 removed \n 50 bin ~720 genes per bin",
+    x = "Gene Length Bin Midpoint (bp)",
+    y = "Counts per Bin / per sample *100",
+    color = "Sample"
+  ) +
+  scale_color_manual(values = c("scRNA" = "#00468B", "snRNA" = "#8B0046")) +
+  scale_x_discrete(breaks = levels(combined_df$bin_mid_factor)[seq(1, length(levels(combined_df$bin_mid_factor)), by = 2)])+
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+     axis.line = element_line(color = "black"),
+    plot.title = element_text(size = 8) 
+  )
+
+
+dev.off()
+```
+#### Gene GC  re-visualization after filtering some genes like HBs and RPs
+
+```{r, GC}
+
+#############
+############ Define the gene GC-Percentage categories
+#############
+
+for (obj in names(merged_obj_list_Sub)){
+  sobj <- merged_obj_list_Sub[[obj]]
+  # Step 1: Get the gene row sums across all barcodes (total count per gene)
+  count_matrix <- sobj@assays$RNA$counts
+  nCount_per_gene <- rowSums(count_matrix)
+ if(identical(names(nCount_per_gene), rownames(sobj))) {#TRUE
+ sobj@assays$RNA@meta.data$nCount_per_gene <- nCount_per_gene}
+  merged_obj_list_Sub[[obj]] <- sobj
+}
+
+all_counts <- list()
+
+for (obj in names(merged_obj_list_Sub)) {
+  sobj <- merged_obj_list_Sub[[obj]]
+  platform <- unique(sobj$Platform)
+  Site <- unique(sobj$Site)
+  Donor <- unique(sobj$Donor)
+  Donor_Site <- unique(sobj$Donor_Site)
+  gene_df <- sobj@assays$RNA@meta.data
+  gene_df <- gene_df[!is.na(gene_df$percentage_gene_gc_content), ]
+
+  gene_df <- gene_df %>%
+  arrange(percentage_gene_gc_content)
+  dens <- density(gene_df$percentage_gene_gc_content, na.rm = TRUE)
+# 
+# # Plot it to inspect
+#  plot(dens, main = "Density Estimate of Gene GC percentage")
+# abline(v = median(gene_df$percentage_gene_gc_content), col = "red", lty = 2)  # Add the raw data median
+
+  # Create bins - use fewer bins for clarity, e.g. 100
+  gene_df$GC_bin <- cut(
+    gene_df$percentage_gene_gc_content,
+    breaks = quantile(gene_df$percentage_gene_gc_content, probs = seq(0, 1, length.out = 100)),
+    include.lowest = TRUE
+  )
+
+  counts_by_bin <- gene_df %>%
+  group_by(GC_bin) %>%
+  summarise(
+    total_counts = sum(nCount_per_gene),
+    gene_number = n()
+  ) %>%
+  mutate(
+    platform = platform,
+    Donor = Donor,
+    Site = Site,
+    Donor_Site = Donor_Site,
+    Site_platform = paste0(Site, "_", platform),
+    Sample_id = obj
+  )
+  all_counts[[obj]] <- counts_by_bin
+}
+
+# Combine all into one dataframe
+combined_df <- bind_rows(all_counts)
+
+
+scientific_num_pattern <- "[0-9\\.eE\\+\\-]+"
+combined_df <- combined_df %>%
+  mutate(
+    bin_start = as.numeric(str_extract(GC_bin, paste0("(?<=\\[|\\()", scientific_num_pattern))),
+    bin_end = as.numeric(str_extract(GC_bin, paste0("(?<=,)", scientific_num_pattern, "(?=\\]|\\))"))),
+    bin_mid = (bin_start + bin_end) / 2
+  )
+
+combined_df$bin_mid_factor <- factor(combined_df$bin_mid)
+
+combined_df <- combined_df %>%
+  group_by(Sample_id) %>%
+  mutate(
+    total_counts_per_sample = sum(total_counts),  # Total counts for the entire sample
+    # Normalize within each sample and calculate percentage of total counts per bin
+    percentage_bin_count = (total_counts / total_counts_per_sample) * 100
+  ) %>%
+  ungroup()
+
+
+
+pdf(file = paste0(fig_path_stnx, "07_Distribution_percentage_gene_gc_content_hvg_removed.pdf"), width = 8, height = 5)
+ggplot(combined_df, aes(x = bin_mid_factor, y = percentage_bin_count, color = platform, group = Sample_id)) +
+  geom_line(size = 0.5, alpha = 0.5) +
+  labs(
+    title = "Percentage of Counts per GC-Percentage-Bin per sample Across 11 Paired Samples \n MTs, RBs, HBs and Malat1 removed \n 50 bins ~720 genes per bin",
+    x = "Gene GC-Percentage Bin Midpoint (bp)",
+    y = "Percentage Counts per Bin per sample",
+    color = "Sample"
+  ) +
+  scale_color_manual(values = c("scRNA" = "#00468B", "snRNA" = "#8B0046")) +
+  scale_x_discrete(breaks = levels(combined_df$bin_mid_factor)[seq(1, length(levels(combined_df$bin_mid_factor)), by = 4)])+
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+     axis.line = element_line(color = "black")
+  )
+
+
+dev.off()
+```

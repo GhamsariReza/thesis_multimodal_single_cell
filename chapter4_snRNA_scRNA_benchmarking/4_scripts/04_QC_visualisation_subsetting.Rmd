@@ -1,0 +1,939 @@
+---
+title: "04_QC_visualisation_subsetting"
+author: "Reza Ghamsari"
+date: "2024-09-10"
+output: html_document
+---
+## Script Overview
+This R Markdown script performs comprehensive quality control (QC) assessment, visualization, and filtering of single-cell 
+and single-nucleus RNA-seq datasets stored in Seurat objects. The workflow includes:
+
+- **Setup**: Reproducible environments, color palettes, and package loading
+- **QC Metrics**: Calculation of mitochondrial, ribosomal, MALAT1, and hemoglobin gene percentages
+- **Outlier Detection**: Median Absolute Deviation (MAD)-based methods at sample and cluster levels
+- **Visualization**: Scatter plots, split violin plots, and statistical comparisons
+- **Data Cleaning**: Outlier removal and cell cycle scoring
+- **Final Processing**: Clustering and dataset preparation for downstream analysis
+
+
+## 1. Setup and Configuration
+### Chunk Timing Setup
+```{r setup, include=FALSE}
+all_times <- list()  # store the time for each chunk
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now)
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  time_it = TRUE
+)
+```
+ Directories and Colors
+```{r, colors}
+# Define custom colors for plots
+my_colors <- c("#802268FF", "#006400", "#525ecc99", "#1f0fdf99", "#480607", "#D55E00", 
+               "#164194FF", "#7E6148FF", "#ADB6B6FF", "#52a7cc99", "#F0E685FF", "#cc52c099", 
+               "#6acc5299", "#DC143C", "#802268FF", "#ffbb78", "#3C548899", "#189b3699", 
+               "#cc9b5299", "#1f0fdf99", "#ccebc5", "#42857599", "#868686FF", "#006400", 
+               "#0A47FFFF", "#3B1B53FF", "#749B58FF", "#ccc05299", "#cc765299", "#1B1919FF", 
+               "#00D68FFF", "#14FFB1FF", "#3C5488FF", "#8F7700FF", "#164194FF", "#0094CDFF", 
+               "#FFDAB9", "#FF00FF", "#00FFFF", "green", "blue", "#480607")
+
+# Define file paths for data storage and output
+rds_path_vst <- "/vast/projects/aml_multiome/Sn_vs_SC/rds_path_vst/"
+fig_path_stnx <- "/home/users/allstaff/ghamsari.r/seurat_figures/Sn_vs_SC_V4/"
+```
+# Loading Required Packages
+```{r pkgs}
+# Script identifier for file naming
+script_title <- "04_QC_visualisation_subsetting"
+# Load necessary libraries
+pkgs <- c(
+  "Signac", "Seurat", "ggplot2", "SoupX", "scCustomize", "gridExtra",
+  "parallel", "parallelly", "clustree", "RColorBrewer", "patchwork", "igraph",
+  "tibble", "biomaRt", "reshape2", "dplyr", "grid", "unix", "future", "future.apply", "tidyverse", "introdataviz", "scales", "Cairo"
+)
+
+
+# Load all packages silently
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# Save session information for reproducibility
+sink(file.path(fig_path_stnx, paste0(script_title, "_sessionInfo.txt")))
+sessionInfo()
+sink()
+```
+## 2. Data Loading and Initial Assessment
+Load Seurat Objects
+
+
+#Reading data
+```{r, reading objects}
+# Load preprocessed Seurat object list (22 samples: 11 snRNA-seq + 11 scRNA-seq)
+sobj_list <- readRDS(paste0(rds_path_vst, "03_Doublet_SoupX_corrected_gene_annotations_Seurat_object_list_22_samples_11sn_11sc.rds"))
+# Verify data normalization status (should be FALSE for raw counts)
+identical(sobj_list_v0$S1_D1_cell@assays$RNA$counts, sobj_list_v0$S1_D1_cell@assays$RNA$data) #FALSE
+```
+
+#Parallel Feature Percentage Calculation in Seurat Objects
+Defines a function to compute QC-related gene percentages (e.g., mitochondrial, ribosomal, MALAT1) in a Seurat object, and sets up parallel processing using available CPU cores.
+```{r,}
+# Define common file path
+PercentageFeatures <- function(seuratObj) {
+DefaultAssay(seuratObj) <- "RNA"
+featureList <- list(
+  percent.mt = "^MT-",                                # Mitochondrial genes, quality control for potential cytoplasmic contamination
+  percent.rb = "^RP[SL]",                             # Ribosomal genes, quality control for potential ribosomal RNA contamination
+  percent.HBB_HBA2 = "^HB(B|A2)$",                    # Red blood cell markers,   Hemoglobin genes, potential markers for erythroid lineage cells
+  percent.malat1 = "MALAT1"                         # Nuclear-enriched non-coding RNA, potential marker for nuclear integrity
+)
+  for (featureName in names(featureList)) {
+    pattern <- featureList[[featureName]]
+    seuratObj[[featureName]] <- Seurat::PercentageFeatureSet(seuratObj, pattern)
+  }
+
+
+  return(seuratObj)
+}
+
+
+# Use detectCores() to identify the number of available cores
+num_cores <- parallelly::availableCores()
+
+
+# Use mclapply instead of lapply for parallel processing
+sobj_list <- mclapply(sobj_list, PercentageFeatures, mc.cores = num_cores-5)
+
+
+for (obj in names(sobj_list)) {
+  print(obj)
+  sobj <- sobj_list[[obj]]
+  sobj$Average_MT_Pct <- mean(sobj$percent.mt)
+  sobj$Average_RBP_Pct <- mean(sobj$percent.rb)
+  sobj$Average_malat1_Pct <- mean(sobj$percent.malat1)
+  sobj$Average_HBB_HBA2_Pct <- mean(sobj$percent.HBB_HBA2)
+   sobj$median_MT_Pct <- median(sobj$percent.mt)
+  sobj$median_RBP_Pct <- median(sobj$percent.rb)
+  sobj$median_malat1_Pct <- median(sobj$percent.malat1)
+  sobj$median_HBB_HBA2_Pct <- median(sobj$percent.HBB_HBA2)
+  sobj_list[[obj]] <- sobj
+}
+```
+## 4. Quality Control Visualization
+### Paired featurs QC visualisation
+Scatter plot just for visualisation
+```{r, scatter plot and MAD }
+
+scatter_features <- list(c("nCount_RNA", "nFeature_RNA"), c("percent.mt", "percent.malat1") )
+
+  
+# Get the names of all samples
+samples <- names(sobj_list)
+
+upper_MAD <- 6
+lower_MAD <- 6
+# calculationg mad
+mad_scatter <- function(sobj, feature_1, feature_2, nmads_up, nmads_low) {
+  get_bounds <- function(data, nmads_up, nmads_low) {
+    median_data <- median(data, na.rm = TRUE)
+    mad_data <- mad(data, na.rm = TRUE)
+    lower_bound <- median_data - nmads_low * mad_data
+    upper_bound <- median_data + nmads_up * mad_data
+    return(c(upper_bound, lower_bound))
+  }
+  bounds_f1 <- get_bounds(sobj@meta.data[[feature_1]], nmads_up, nmads_low)
+  bounds_f2 <- get_bounds(sobj@meta.data[[feature_2]], nmads_up, nmads_low)
+  return(list(mads_up_f1 = bounds_f1[1], mads_low_f1 = bounds_f1[2], mads_up_f2 = bounds_f2[1], mads_low_2 = bounds_f2[2]))
+}
+
+create_plot <- function(features, sobj) {
+  bounds <- mad_scatter(sobj, features[1], features[2], upper_MAD, lower_MAD)
+  
+  # Pre-calculate these
+  feature_1_data <- sobj@meta.data[[features[1]]]
+  feature_2_data <- sobj@meta.data[[features[2]]]
+  
+  # Create a subset of data that contains outliers only
+  outliers <- sobj@meta.data[
+    (feature_1_data < bounds$mads_low_f1 | feature_1_data > bounds$mads_up_f1) |
+      (feature_2_data < bounds$mads_low_2 | feature_2_data > bounds$mads_up_f2),
+  ]
+  
+  # Create the plot
+  p <- ggplot(sobj@meta.data, aes_string(x = features[1], y = features[2])) +
+    geom_point(size = 0.3, alpha = 0.6, color = "steelblue") +
+    geom_hline(yintercept = bounds$mads_low_f2, linetype = "dashed", color = "gray", size = 0.5) +
+    geom_hline(yintercept = bounds$mads_up_f2, linetype = "dashed", color = "gray", size = 0.5) +
+    geom_vline(xintercept = bounds$mads_low_f1, linetype = "dashed", color = "gray", size = 0.5) +
+    geom_vline(xintercept = bounds$mads_up_f1, linetype = "dashed", color = "gray", size = 0.5) +
+    geom_point(data = outliers, aes_string(x = features[1], y = features[2]), color = "red", size = 0.3) +
+    annotate("text", x = Inf, y = Inf, label = paste(nrow(outliers),"outliers out of" , nrow(sobj@meta.data)), hjust = 1, vjust = 1, size = 2, colour = "darkblue", face = "bold") +
+    labs(
+      #subtitle = paste(features[2], "vs", features[1]),
+         y = features[2],
+         x = features[1],
+         #title = paste("((", sample, "))"),
+         caption = paste(sample, ": -", lower_MAD , "MAD > outliers > +", upper_MAD,"MAD")) +
+    scale_color_manual(values = brewer.pal(3, "Set1")) +
+    theme(panel.background = element_rect(fill = "white"), 
+          plot.title = element_text(size = 6, face = "bold", hjust = 0.5,  vjust = -2),
+          plot.subtitle = element_text(size = 6, color = "gray",  vjust = -3, hjust = 0.5),
+          plot.caption = element_text(size = 6, face = "bold", hjust = 0.5, color = "darkblue"),
+          axis.title = element_text(size = 6, face = "bold", color = "black"),
+          axis.text = element_text(size = 6, face = "bold"))
+
+  
+  return(ggExtra::ggMarginal(p, fill = "lightblue", col = "darkblue", size = 5))
+}
+
+# Start a new PDF file for all samples
+pdf(file = paste0(fig_path_stnx, "04_scatter_plots_visualisation_all_cells_before_subsetting_MAD_6.pdf"), width = 14, height = 7)
+
+# Loop over all samples
+for (sample in samples) {
+  sobj <- sobj_list[[sample]]
+  plots <- list()
+  for (features in scatter_features) {
+    plot <- create_plot(features, sobj)
+    plots[[length(plots) + 1]] <- plot
+  }
+  
+  # Arrange and display the plots on one page
+  grid.arrange(grobs = plots, ncol = 2)
+}
+dev.off()
+```
+## Split Violin Plots with Statistical Testing
+Log-Scaled Split Violin Plots: A paired Wilcoxon test is performed on the summarized median values for each donor site, comparing the scRNA and snRNA values.
+```{r Split Violin Plots}
+all_features <- c("nCount_RNA" , "nFeature_RNA", "percent.mt", "percent.rb", "percent.HBB_HBA2", "percent.malat1")
+pdf(file = paste0(fig_path_stnx, "04_split_violin_log_mt_per_cell_before_subsetting.pdf"), width = 18, height = 11)
+sink(file = paste0(fig_path_stnx, "04_split_violin_log_mt_per_cell_before_subsetting_wilcoxon_test_results.txt"), append = TRUE)
+for (i in seq_along(all_features)) { 
+  scatter_features <- all_features[i]
+# Define a color palette for the Donor_Site values 
+all_data <- list()
+samples <- names(sobj_list)
+for (sample in samples) {
+  sobj <- sobj_list[[sample]]
+  feature_data <- sobj@meta.data[[scatter_features]]
+  all_data[[sample]] <- feature_data
+}
+
+# Compiling Data
+data_long <- data.frame(
+  value = unlist(all_data),
+  sample = rep(names(all_data), times = sapply(all_data, length))
+)
+
+# Extracting Donor and Site
+data_long$Donor_Site <- gsub("_[^_]*$", "", data_long$sample)
+data_long$Site <- gsub("_(.*)$", "", data_long$sample)
+# Determine if the sample is a cell or nuclei
+data_long$type <- ifelse(grepl("_Nuclei", data_long$sample), "snRNA", "scRNA")
+
+##########################
+##########################
+##########################
+# Summarize the data: Calculate the median (or mean) value per Donor_Site and type
+summarized_data <- data_long %>%
+  group_by(Donor_Site, type) %>%
+  summarize(median_value = median(value, na.rm = TRUE)) %>%
+  ungroup()
+
+# create a wide format: One column for scRNA and another for snRNA
+summarized_data_wide <- summarized_data %>%
+  pivot_wider(names_from = type, values_from = median_value) %>%
+  drop_na()  # Drop rows where either scRNA or snRNA is missing
+
+##########################
+########################## Performing the paired Wilcoxon test on the summarized data (scRNA vs snRNA for each Donor_Site)
+##########################
+test_result <- wilcox.test(summarized_data_wide$scRNA, summarized_data_wide$snRNA, paired = TRUE)
+# summary(test_result)
+p_value <- test_result$p.value
+
+ # Write the test results (p-value) into the text file
+cat(paste0("Feature: ", scatter_features, "\n"))
+cat(paste0("Wilcoxon test p-value: ", round(p_value, 4), "\n"))
+cat("Wilcoxon test summary:\n")
+print(test_result)  # `print()` instead of `summary()` for wilcox.test
+cat("\n\n")
+
+##########################
+########################## Plotting
+##########################
+plot <- ggplot(data_long, aes(x = Donor_Site, y = value, fill = type)) +  
+  introdataviz::geom_split_violin(alpha = 0.4, trim = FALSE, color = "transparent" , width = 1.5) +
+  geom_boxplot(width = 0.3, alpha = 0.6, fatten = NULL, show.legend = FALSE, outlier.size = 0.5, color = "white",     # Adjust the size of the outlier dots (e.g., 2.5)
+               outlier.color = "gray", outlier.alpha = 0.4) +  # Adjust the color of the outlier dots) +
+  stat_summary(aes(color = Site),fun.data = "mean_se", geom = "pointrange", show.legend = T, 
+               position = position_dodge(0.300), size = 1.8, alpha = 0.9) +    
+  scale_y_log10(name = paste(scatter_features, "Log10")) +  
+  labs(x = "Donor") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 18), 
+        axis.title.x = element_text(size = 22),
+        axis.title.y = element_text(size = 22),
+        plot.title = element_text(size = 22, hjust = 0.5 , face = "bold"),
+        plot.subtitle = element_text(size = 16),
+        legend.text = element_text(size = 20),
+        legend.title = element_text(size = 20)) +
+  scale_fill_manual(name= "Platform", values=c("scRNA"="#6699CC", "snRNA"= "#CC6677")) +
+  scale_color_manual(name= "Site", values = c("S1" = "#00468B", "S2" = "#008B8B", "S3" = "#FFDB6D", "S4" = "#8B0046")) +
+  guides(fill = guide_legend(override.aes = list(shape = NA)),  # No points in fill legend
+        color = guide_legend(override.aes = list(fill = NA, linetype = 0)))+ # No bars in color legend
+ggtitle(paste(scatter_features,": Single Cell vs. Single Nuclei Sequencing")) +
+      theme(plot.title = element_text(size = 14)) +  # Larger title font
+      # Add p-value as subtitle with smaller font
+      labs(subtitle = paste("Wilcoxon test p-value:: ", round(p_value, 4))) +
+      theme(plot.subtitle = element_text(size = 10))  # Smaller subtitle font
+
+print(plot)
+}
+
+sink()
+dev.off()
+```
+## 5. Biology-Aware Quality Control
+### Cluster-Based Outlier Detection
+Clustering before QC
+Violin plot log MAD Threshold MAD for each cluster
+Generating violin and jitter plots to visualize QC metrics (nCount_RNA, nFeature_RNA, and percent.mt) across cell clusters (e.g., doub_clusters) in single-cell RNA-seq data. 
+I used a log(x+1) transformation for better scaling and applied a Median Absolute Deviation (MAD)-based method (±3 MADs) to detect and highlight outliers within each cluster.
+Outlier counts are annotated on each plot, and results are saved into a multi-page PDF for all samples.
+```{r,}
+
+nmads_up <- 3
+nmads_low <- 3
+
+log_plus_one_trans <- trans_new(
+  name = "log_plus_one",
+  transform = function(x) log(x + 1),
+  inverse = function(x) exp(x) - 1
+)
+
+all_features <- c("nCount_RNA", "nFeature_RNA")
+
+group_by <- c("doub_clusters")
+
+get_bounds <- function(data, nmads_up, nmads_low) {
+    # Apply log1p transformation
+    log_data <- log1p(data)
+    median_log_data <- median(log_data, na.rm = TRUE)
+    mad_log_data <- mad(log_data, na.rm = TRUE)
+
+    # Calculate bounds in log scale
+    lower_bound_log <- median_log_data - nmads_low * mad_log_data
+    upper_bound_log <- median_log_data + nmads_up * mad_log_data
+
+    # Convert bounds back to original scale
+    lower_bound <- expm1(lower_bound_log)
+    upper_bound <- expm1(upper_bound_log)
+
+    return(c(upper_bound, lower_bound))
+}
+
+
+# Start a new PDF file for all samples
+pdf(file = paste0(fig_path_stnx, "04_violins_per_cluster_qc_log_raw_clusters_log_MAD_3Features_3_MAD.pdf"), width = 24, height = 16, pointsize = 5)
+
+# Function to plot and arrange a subset of plots on a page
+plot_page <- function(plots) {
+  num_plots <- length(plots)
+  num_cols <- 2  # Number of columns in the grid
+  num_rows <- ceiling(num_plots / num_cols)  # Calculate the number of rows
+  grid.arrange(grobs = plots, ncol = num_cols, nrow = num_rows)
+}
+
+# Iterate over all the plots and arrange them in pages
+page_plots <- list()
+
+for (sample in names(sobj_list)
+     ) {
+  for (group in group_by) {
+    for (feature in all_features) {
+      # Extract the data
+      data <- Seurat::FetchData(sobj_list[[sample]], vars = c(feature, group))
+      total_num_cells <- nrow(data)
+            # Ensure consistent ordering of factor levels
+      data[[group]] <- factor(data[[group]], levels = unique(data[[group]]))
+      # Initialize an empty dataframe to store outliers
+      outliers <- data.frame()
+      clusters <- levels(data[[group]])
+
+      outlier_counts <- vector("list", length = length(clusters))
+      names(outlier_counts) <- clusters
+
+      # Iterate over each group to calculate outliers
+      for (cluster_number in clusters) {
+        
+      # Calculate bounds for each group
+      bounds <- get_bounds(data[[feature]][data[[group]] == cluster_number], nmads_up, nmads_low)
+      feature_data_max <- bounds[1]
+      feature_data_min <-  bounds[2]
+
+      # Subset for outliers and add to the outliers dataframe
+      clusters_outliers <- data[(data[[feature]] < feature_data_min | data[[feature]] > feature_data_max) & data[[group]] == cluster_number, ]
+  
+cluster_outlier_count <- nrow(clusters_outliers)
+outlier_counts[[cluster_number]] <- cluster_outlier_count
+         outliers <- rbind(outliers, clusters_outliers)
+        }
+max_y <- max(data[[feature]], na.rm = TRUE)
+min_y <- min(data[[feature]], na.rm = TRUE)
+
+data$is_outlier <- rownames(data) %in% rownames(outliers)
+# Define colors for outliers
+outlier_colors <- c("TRUE" = "red" , "FALSE" = "#a6cee3") # Adjust colors as needed
+data$outlier_color <- outlier_colors[as.character(data$is_outlier)]
+
+# Calculate total number of outliers for the caption
+outliers_sum <- sum(unlist(outlier_counts))
+legend_labels <- c("TRUE" = "Outlier", "FALSE" = "Passed")
+print(outliers_sum)
+try({
+plot <- ggplot(data, aes_string(x = group, y = feature)) +
+         geom_jitter(aes(color = is_outlier), width = 0.3, size = 0.05, alpha = 0.8, show.legend= TRUE) +
+         
+          scale_color_manual(
+    values = outlier_colors, 
+    labels = legend_labels,  # Add custom labels
+    name = "QC"          # Set legend title
+  ) +
+        
+
+         geom_violin(aes_string(color = group), trim = FALSE, alpha = 0.9, fill = NA,  show.legend= TRUE) +
+
+  labs(
+    title = paste0(sample, "(log+1)", ": -", nmads_low , "MAD > outliers > +", nmads_up,"MAD"),
+    # subtitle = paste0("total outlier number: ",outliers_sum),
+  caption = paste0("Total number of outlier detected:", outliers_sum, " out of ", total_num_cells, " cells" )
+  # ,
+  # color = "clusters"
+  )+
+
+         scale_y_continuous(trans = log_plus_one_trans, breaks = round(exp(seq(log(min_y), log(max_y), by = (log(max_y) - log(min_y)) / 8))))+
+    theme(panel.background = element_rect(fill = "white"), 
+          plot.title = element_text(size = 10, face = "bold", hjust = 0.5,  vjust = -2),
+          plot.subtitle = element_text(size = 6, color = "black",  vjust = -3, hjust = 0.5),
+          plot.caption = element_text(size = 10, hjust = 0.5, color = "black"),
+          axis.title = element_text(size = 6, face = "bold", color = "black"),
+          axis.text = element_text(size = 6, face = "bold"))
+  # Add the plot to the list of plots
+  # Annotate with outlier counts
+      for (cluster_level in levels(data[[group]])) {
+        cluster_number <- which(levels(data[[group]]) == cluster_level)
+        outlier_count <- outlier_counts[[cluster_level]]
+
+    x_offset <- 0  # Adjust this value as needed
+    y_multiplier <- 2.5  # Adjust this value as needed
+
+    # Calculate new position for text
+    adjusted_x_position <- as.numeric(cluster_number) + x_offset
+    adjusted_y_position <- max_y * y_multiplier
+
+    plot <- plot + geom_text(
+        aes_string(x = adjusted_x_position, y = adjusted_y_position, label = outlier_count), 
+        color = "#9E0142" , # Text color
+        fill = "gray",   # Background color of the label box: i used geom_lable to change the background color but it was very slow so I change to text again.
+        label.padding = unit(0.5, "lines"),
+    )
+
+      }
+}, silent = TRUE)
+
+
+      page_plots[[length(page_plots) + 1]] <- plot
+
+      # Arrange the page if necessary
+      if (length(page_plots) == 2) {
+        plot_page(page_plots)
+        page_plots <- list()
+      }
+    }
+  }
+}
+
+# Close the multi-page PDF file
+dev.off()
+
+```
+## 6. Outlier Removal and Data Cleaning
+### MAD-Based Outlier Detection Function
+```{r}
+all_features <- c("nCount_RNA", "nFeature_RNA")
+get_bounds <- function(data, nmads_up, nmads_low) {
+    # Apply log1p transformation
+    log_data <- log1p(data)
+    median_log_data <- median(log_data, na.rm = TRUE)
+    mad_log_data <- mad(log_data, na.rm = TRUE)
+
+    # Calculate bounds in log scale
+    lower_bound_log <- median_log_data - nmads_low * mad_log_data
+    upper_bound_log <- median_log_data + nmads_up * mad_log_data
+
+    # Convert bounds back to original scale
+    lower_bound <- expm1(lower_bound_log)
+    upper_bound <- expm1(upper_bound_log)
+
+    return(c(upper_bound, lower_bound))
+}
+
+
+OUTLIERS_FUN <- function(seurat_object, feature, clustering, nmads_up, nmads_low) {
+  seurat_object@meta.data[[clustering]] <- factor(seurat_object@meta.data[[clustering]], levels = unique(seurat_object@meta.data[[clustering]]))
+
+  all_outliers <- data.frame()  # Initialize as an empty data frame
+  
+  clusters <- unique(seurat_object@meta.data[[clustering]])
+  
+  for (cluster in clusters) {
+    # Subset data for the current cluster
+    cluster_data <- seurat_object@meta.data[[feature]][seurat_object@meta.data[[clustering]] == cluster]
+    
+    # Calculate bounds for the current cluster
+    bounds <- get_bounds(cluster_data, nmads_up, nmads_low)
+    feature_data_max <- bounds[1]
+    feature_data_min <- bounds[2]
+    
+    # Detect outliers
+    clusters_outliers <- seurat_object@meta.data[(seurat_object@meta.data[[feature]] < feature_data_min | seurat_object@meta.data[[feature]] > feature_data_max) & seurat_object@meta.data[[clustering]] == cluster, ]
+    all_outliers <- rbind(all_outliers, clusters_outliers)
+  }
+  
+  # Mark outliers in seurat_object@meta.data
+  outlier_rows <- rownames(seurat_object@meta.data) %in% rownames(all_outliers)
+  seurat_object@meta.data$QC_MAD <- "Passed"
+  seurat_object@meta.data[outlier_rows, "QC_MAD"] <- "OUTLIER"
+  
+  return(seurat_object)
+}
+
+#################################
+#################################
+
+sobj_list_outliers <- list()
+for (sobj in names(sobj_list)){
+  sobject <- sobj_list[[sobj]]
+  for (feature_out in all_features){
+  sobject <-  OUTLIERS_FUN(sobject, feature = feature_out, clustering= "doub_clusters", nmads_up= 3, nmads_low = 3)}
+  sobj_list_outliers[[sobj]] <- sobject
+}
+
+for (sobj in names(sobj_list_outliers)){
+  sobject <- sobj_list_outliers[[sobj]]
+  print(paste0(sobj,"= ", table(sobject@meta.data$QC_MAD)))}
+
+
+for (sobj in names(sobj_list_outliers)) {
+  sobject <- sobj_list_outliers[[sobj]]
+  qc_mad_table <- table(sobject@meta.data$QC_MAD)
+  
+  # Calculate the proportion of outliers
+  outlier_count <- qc_mad_table["OUTLIER"]
+  total_count <- sum(qc_mad_table)
+  proportion_outliers <- round(outlier_count / total_count*100)
+  print(paste0(sobj, " - Proportion of Outliers: ", proportion_outliers))
+}
+
+# Create a vector to store the proportions
+proportion_outliers_vector <- numeric(length(names(sobj_list_outliers)))
+
+for (sobj in names(sobj_list_outliers)) {
+  sobject <- sobj_list_outliers[[sobj]]
+  qc_mad_table <- table(sobject@meta.data$QC_MAD)
+  
+  # Calculate the proportion of outliers
+  outlier_count <- qc_mad_table["OUTLIER"]
+  total_count <- sum(qc_mad_table)
+  proportion_outliers <- round(outlier_count / total_count * 100)
+  
+  # Store the proportion in the vector
+  proportion_outliers_vector[sobj] <- proportion_outliers
+  
+  # Print the proportion
+  print(paste0(sobj, " - Proportion of Outliers: ", proportion_outliers))
+}
+
+# Create a data frame with the counts of outliers and total cells for each sample
+plot_data <- data.frame(
+  Object = names(sobj_list_outliers),
+  Total_Cells = sapply(sobj_list_outliers, function(sobj) ncol(sobj)),
+  Outliers = sapply(sobj_list_outliers, function(sobj) sum(sobj@meta.data$QC_MAD == "OUTLIER"))
+)
+
+
+# Reshape data to long format
+long_data <- gather(plot_data, key = "Category", value = "Count", -Object)
+
+# Define colors 
+cell_colors <- c("Total_Cells" = "#386cb0", "Outliers" = "#9E0142")
+
+
+# Create a stacked bar plot
+p <- ggplot(long_data, aes(x = Object, y = Count, fill = Category)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = cell_colors) +
+  labs(
+    title = "Number of Outliers in Each Sample (Detected by MAD=±3 on log of each cluster)",
+    x = "Donors",
+    y = "Cell Count"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),            # Remove all grid lines
+    panel.background = element_rect(fill = "white", color = NA),  # Set panel background to white
+    plot.background = element_rect(fill = "white", color = NA),   # Set entire plot background to white
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(size = 10, face = "bold", hjust = 0.5)
+  )
+
+
+
+ggsave(paste0(fig_path_stnx, "04_outliers_propotion_based_log_data_mad_clusters.png"), width = 10, height = 6, dpi = 300)
+
+```
+
+## Remove Outliers and Apply Final Filters 
+```{r,}
+sobj_list_subset <- list()
+removed_cells_df <- data.frame(Sample = character(), Removed = integer(), Total = integer(), stringsAsFactors = FALSE)
+
+for (sample in names(sobj_list_outliers)) {
+  sobj <- sobj_list_outliers[[sample]]
+  col1 <- ncol(sobj)
+
+  sobj <- subset(
+    x = sobj,
+    subset = 
+      nCount_RNA > 100 &
+      nFeature_RNA > 50 &
+      percent.mt < 10 &
+      scDblFinder_RNA_SCT == "singlet" &
+      QC_MAD == "Passed"
+  )
+
+  sobj_list_subset[[sample]] <- sobj
+  col2 <- ncol(sobj)
+# Track removed cells
+  removed_cells_df <- rbind(removed_cells_df, data.frame(
+    Sample = sample,
+    Removed = col1 - col2,
+    Total = col1
+  ))
+}
+# Visualize cell removal summary
+# Convert to long format for stacked bar plot
+long_data <- removed_cells_df %>%
+  select(Sample, Outliers = Removed, Total_Cells = Total) %>%
+  pivot_longer(cols = c("Outliers", "Total_Cells"),
+               names_to = "Category",
+               values_to = "Count") %>%
+  rename(Object = Sample)
+
+# Compute cumulative positions for text labels
+long_data <- long_data %>%
+  group_by(Object) %>%
+  arrange(Object, desc(Category)) %>%  # Ensure consistent stacking order
+  mutate(pos = cumsum(Count) - Count / 2)
+
+# Define custom colors
+cell_colors <- c("Total_Cells" = "#386cb0", "Outliers" = "#9E0142")
+
+# Create stacked bar plot with labels
+p <- ggplot(long_data, aes(x = Object, y = Count, fill = Category)) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(y = pos, label = Count), size = 2, color = "white", fontface = "bold") +
+  scale_fill_manual(values = cell_colors) +
+  labs(
+    title = "Number of Total Outliers Detected in Each Sample",
+    x = "Sample",
+    y = "Cell Count"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(size = 10, face = "bold", hjust = 0.5)
+  )
+
+# Display plot
+print(p)
+
+# Save to file
+ggsave(paste0(fig_path_stnx, "04_total_removed_outliers.png"), plot = p, width = 10, height = 6, dpi = 300)
+
+```
+## 7. Cell Cycle Scoring
+Add Cell Cycle Information
+
+```{r,}
+#Cell cycle genes
+s.genes <- Seurat::cc.genes$s.genes
+g2m.genes <- Seurat::cc.genes$g2m.genes
+
+CELL_CYCLE <- function(x) {
+  Seurat::DefaultAssay(x) <- "RNA"
+    x <- Seurat::CellCycleScoring(x, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+    return(x)
+}
+
+# Use mclapply instead of lapply for parallel processing
+sobj_list_subset <- lapply(sobj_list_subset, CELL_CYCLE)
+
+```
+## 8. Final Processing and Clustering
+Individual Sample Clustering
+
+```{r, clustering}
+resolutions <- c(0.01, 0.05, 0.1, 0.3, 0.5, 0.8, 1, 1.2, 1.5, 2)
+processSeurat <- function(x) {
+    x <- SCTransform (x, vst.flavor = "v2", verbose = FALSE,new.assay.name = "SCT_indiv", seed.use = 1448145)
+    message("Running PCA...")
+    x <- RunPCA(x, reduction.name= 'pca_indiv', assay = "SCT_indiv")
+    message("Finding Neighbors...")
+    x <- FindNeighbors(x, reduction = 'pca_indiv', dims = 1:50, graph.name='graph_indiv')
+    x <- FindClusters(x, graph.name = "graph_indiv",resolution = resolutions, verbose = FALSE)
+    x@meta.data$indiv_clusters <- x@meta.data$seurat_clusters
+    x@meta.data$clustering_individual <- paste0(x@meta.data$sample_id, "_", x@meta.data$seurat_clusters)
+    x@meta.data$doub_clusters <- NULL
+    x@meta.data$QC_MAD <- NULL
+    x@meta.data$scDblFinder_RNA_SCT <- NULL
+    indiv_meta.data <- x@meta.data
+    return(indiv_meta.data)
+}
+
+
+# To identify the number of available cores
+num_cores <- parallelly::availableCores() #56
+plan(multisession, workers = num_cores - 4)
+indiv_final_metadata_list <- future_lapply(sobj_list_subset, processSeurat)
+length(indiv_final_metadata_list) #22
+saveRDS(indiv_final_metadata_list, paste0(rds_path_vst, "01_metadata_list_final_clustering_individuals_22seurat_objects_11sn_11sc.rds"))
+
+
+###############################
+############################### Add Sample Annotations
+###############################
+colnames(indiv_final_metadata_list$S1_D1_cell)
+
+for (name in names(indiv_final_metadata_list)){
+  meta <- indiv_final_metadata_list[[name]]
+  # Extracting Donor and Site
+meta$Donor_Site <- gsub("_[^_]*$", "", meta$sample_id)
+meta$Site <- gsub("_(.*)$", "", meta$sample_id)
+# Determine if the sample is a cell or nuclei
+meta$Platform <- ifelse(grepl("_Nuclei", meta$sample_id), "snRNA", "scRNA")
+meta$Donor <- sub(".*(D\\d+).*", "\\1",meta$sample_id)
+indiv_final_metadata_list[[name]] <- meta
+}
+
+
+###############################
+###############################
+###############################
+for (name in names(indiv_final_metadata_list)){
+metadata <- indiv_final_metadata_list[[name]]
+
+# Create a list of columns corresponding to clustering results at different resolutions
+resolution_cols <- grep("^graph_indiv_res", colnames(metadata), value = TRUE)
+
+# Initialize an empty data frame to store the results
+unique_cluster_counts <- data.frame(Sample = unique(metadata$sample_id))  # Create a sample identifier
+
+# Loop through each resolution and calculate the number of unique clusters per sample
+for (res in resolution_cols) {
+  # Get unique clusters for each sample (assuming the clusters are stored in metadata for each sample)
+  unique_clusters <- sapply(unique(metadata$sample_id), function(sample) {
+    sample_data <- metadata[metadata$sample_id == sample, ]  # Subset data by sample_id
+    length(unique(sample_data[[res]]))  # Get the number of unique clusters for that resolution
+  })
+  
+  # Store the result in the data frame
+  unique_cluster_counts[[res]] <- unique_clusters
+}
+print(unique_cluster_counts)
+# Calculate the mean number of unique clusters across resolutions for each sample
+unique_cluster_counts$mean_unique_clusters <- rowMeans(unique_cluster_counts[, -1])  # Exclude the 'Sample' column
+
+metadata$sample_average_cluster_number <- unique_cluster_counts$mean_unique_clusters
+print(paste0("for sample ", name, " average number of clusters: ", unique_cluster_counts$mean_unique_clusters))
+indiv_final_metadata_list[[name]] <- metadata}
+
+###############################
+###############################
+###############################
+
+for (obj_name in names(sobj_list_subset)) {
+  for (meta_name in names(indiv_final_metadata_list)) {
+    
+    if (obj_name == meta_name) {
+      print(paste("Matching names:", obj_name == meta_name))
+      sobject <- sobj_list_subset[[obj_name]]
+      indiv_meta_obj <- indiv_final_metadata_list[[meta_name]]
+      
+      # Check if row names in metadata match column names in Seurat object
+      if (identical(rownames(indiv_meta_obj), colnames(sobject))) {
+        print(paste("identical barcodes:", identical(rownames(indiv_meta_obj), colnames(sobject))))
+
+        sobject$clustering_individual <- paste0(indiv_meta_obj$sample_id, "_", indiv_meta_obj$graph_indiv_res.0.3)
+        sobject$cluster_number_average_per_sample <- indiv_meta_obj$sample_average_cluster_number
+        sobject@meta.data$doub_clusters <- NULL
+        sobject@meta.data$QC_MAD <- NULL
+        sobject@meta.data$scDblFinder_RNA_SCT <- NULL
+        sobj_list_subset[[obj_name]] <- sobject
+      }
+    }
+  }
+}
+sobj_list_subset <- sobj_list_subset[!sapply(sobj_list_subset, is.null)]
+length(sobj_list_subset) #22
+```
+## 9. Data Export and Merging
+Extract and Save Metadata from Filtered Seurat Objects
+This chunk iterates through a list of filtered Seurat objects to extract and store their metadata in a separate list. 
+Both the metadata list and the full Seurat object list are saved as RDS files for future use, 
+preserving preprocessing results like outlier removal and correction steps.
+```{r}
+new_metadata_list <- list()
+for (sobj_name in names(sobj_list_subset)) {
+  # Retrieve the Seurat object
+  sobj <- sobj_list_subset[[sobj_name]]
+   new_metadata_list[[sobj_name]] <- sobj@meta.data }
+saveRDS(new_metadata_list, paste0(rds_path_vst, "04_MetaData_removed_outliers_ready_to_merge.rds"))
+saveRDS(sobj_list_subset, paste0(rds_path_vst, "04_Sobj_list_outlier_removed_SoupX_corrected_gene_annotations_list_22_samples_11sn_11sc.rds"))
+# sobj_list_subset <- readRDS(paste0(rds_path_vst, "04_Sobj_list_outlier_removed_SoupX_corrected_gene_annotations_list_22_samples_11sn_11sc.rds"))
+```
+
+### Merging Seurat Objects
+
+This chunk modifies the cell barcode names in a list of Seurat objects to ensure uniqueness across samples before merging them into a single Seurat object. The merged object is then saved as an RDS file for downstream analysis.
+```{r}
+table(merged_obj$cluster_number_average_per_sample, merged_obj$sample_id)
+colnames(sobj_list_subset$S2_D1_Nuclei)
+for (name in names(sobj_list_subset)) {
+  colnames(sobj_list_subset[[name]]) <- sub("1$", name, colnames(sobj_list_subset[[name]]))
+}
+
+merged_obj <- merge(x=sobj_list_subset[[1]], y=sobj_list_subset[2:length(sobj_list_subset)], add.cell.ids = NULL,  project = "SnVsSc")
+merged_obj$Donor_Site <- gsub("_[^_]*$", "", merged_obj$sample_id)
+merged_obj$Site <- gsub("_(.*)$", "", merged_obj$sample_id)
+# Determine if the sample is a cell or nuclei
+merged_obj$Platform <- ifelse(grepl("_Nuclei", merged_obj$sample_id), "snRNA", "scRNA")
+merged_obj$Donor <- sub(".*(D\\d+).*", "\\1",merged_obj$sample_id)
+
+```
+
+### Adding percentage of doublet per sample
+```{r}
+df <- read.csv(paste0(fig_path_stnx, "03_Doublet_percentage_SCT.csv"), row.names = 1)
+# Make sure they match by sample ID
+matching_idx <- match(merged_obj@meta.data$sample_id, df$Sample)
+
+# Then assign the doublet percentage
+merged_obj@meta.data$Doublet_Percentage <- df$doublet_percentage[matching_idx]
+saveRDS(merged_obj, paste0(rds_path_vst, "04_Merge_object_outlier_removed_SoupX_corrected_gene_annotations_list_22_samples_11sn_11sc.rds"))
+```
+## 10. Final Quality Visualization
+### Plotting features per sample
+```{r,}
+df <- merged_obj@meta.data
+df <- df %>%
+  dplyr::select(sample_id, Ambient_RNA_Percentage, Average_MT_Pct, Doublet_Percentage,
+         cluster_number_average_per_sample, Platform, Site, Donor_Site) %>%
+  dplyr::group_by(sample_id) %>%
+  dplyr::summarise(across(everything(), dplyr::first), .groups = "drop")
+
+# Columns to plot
+features <- c("cluster_number_average_per_sample", "Ambient_RNA_Percentage", "Average_MT_Pct", "Doublet_Percentage")
+
+file.edit <- df %>%
+      dplyr::group_by(Donor_Site)
+# Adjusted width for the PDF
+pdf(file = paste0(fig_path_stnx, "04_violin_paired_ambient_doublet_mt_cluster_number.pdf"), width = 12, height = 16)
+
+plots <- list()
+for (feature in features) {
+    file.edit <- df %>%
+      dplyr::group_by(Donor_Site) %>%
+      mutate(
+        paired = seq(1:length(Donor_Site)),
+        x_pos = case_when(
+          Platform == "scRNA" ~ -0.020,
+          Platform == "snRNA" ~ 0.020
+        ),
+        box_pos = case_when(
+          Platform == "scRNA" ~ -0.0,
+          Platform == "snRNA" ~ 0.0
+        )
+      )
+    # Perform Wilcoxon signed-rank test for paired data
+    test_result <- wilcox.test(file.edit[[feature]] ~ Platform, data = file.edit, paired = TRUE)
+    
+    # Check if p-value is significant (p < 0.05)
+    significance <- ifelse(test_result$p.value < 0.05, "Significant", "Not Significant")
+    p_value <- test_result$p.value
+    
+    
+    color_platform_map <- c("scRNA" = "#00468B", "snRNA" = "#8B0046")
+    fill_platform_map <- c("scRNA" = "#6699CC", "snRNA" = "#CC6677")
+
+    plot <- ggplot(data = file.edit, aes_string(x = "0", y = feature)) +
+      introdataviz::geom_split_violin(aes(fill = Platform), alpha = 0.3, trim = FALSE, color = "transparent", width = 0.3, show.legend = FALSE) +
+      geom_line(aes(x = x_pos, group = Donor_Site, color = Site), position = position_dodge(0), alpha = 0.9, size = 0.05) +
+      geom_point(aes(x = x_pos, color = Site, group = paired), alpha =0.85, size = 1.5, shape = 8, position = position_dodge(0)) +
+      geom_boxplot(aes(x = box_pos, fill = Platform), width = 0.025, alpha = 0.4, size = 0.05, fatten = NULL, show.legend = TRUE, outlier.size = 0.5, color = "white",
+                   outlier.color = "gray", outlier.alpha = 0.6) +
+       stat_summary(aes(x = box_pos, fill = Platform, color = Platform), fun.data = "mean_se", geom = "pointrange", 
+                   show.legend = TRUE, position = position_dodge(0.025), size = 0.8, alpha = 1) +
+      theme_classic() +
+      theme(
+            axis.text.x = element_blank(),
+            axis.title.x = element_blank(),
+            axis.text.y = element_text(size = 10),
+            plot.title = element_text(size = 15, hjust = 0.5 , face = "bold"),
+            legend.text = element_text(size = 10),
+            legend.title = element_text(size = 10),
+            legend.position = "right",
+            legend.box.background = element_rect(fill = "transparent", color = "transparent")  
+      ) +
+      guides(color = guide_legend(override.aes = list(size = 1, shape = 19)))+
+      scale_fill_manual(values = fill_platform_map,  name = "Platform") +
+      scale_color_manual(name = "Legends", values = c("S1" = "#661100", "S2" = "#888888", "S3" = "#008B45", "S4" = "#D55E00", "scRNA" = "#00468B", "snRNA" = "#8B0046"),  labels = c("S1" = "Lab1","S2" = "Lab2", "S3" = "Lab3", "S4" = "Lab4", "scRNA" = "scRNA-seq", "snRNA" = "snRNA-seq"))+
+      # Add the title 
+      ggtitle(feature) +
+      theme(plot.title = element_text(size = 14)) +  # Larger title font
+      # Add p-value as subtitle with smaller font
+      labs(subtitle = paste("Wilcoxon signed-rank test; p-value: ", round(p_value, 4))) +
+      theme(plot.subtitle = element_text(size = 10))  # Smaller subtitle font
+    
+    plots[[length(plots) + 1]] <- plot
+    if (length(plots) == 8) {
+        grid.arrange(grobs = plots, ncol = 2, nrow = 4) 
+        plots <- list()  # Reset the plots list
+    } 
+}
+
+# If there are remaining plots after the loop, arrange them on the final page
+if (length(plots) > 0) {
+  grid.arrange(grobs = plots, ncol = 2, nrow = 4)
+} 
+
+dev.off()
+```
+
+
+
+

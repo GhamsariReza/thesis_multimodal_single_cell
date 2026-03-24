@@ -1,0 +1,1629 @@
+---
+title: "05_Cell_annotation_merged_objects"
+author: "Reza Ghamsari"
+date: "2024-09-24"
+output: html_document
+---
+## Script Overview
+This script performs comprehensive cell type annotation on merged single-cell and single-nucleus RNA-seq datasets. 
+It includes dimensionality reduction, batch effect correction, clustering, cell type annotation using both manual and automated approaches (Azimuth), 
+and extensive visualization of results.
+```{r setup, include=FALSE}
+all_times <- list()  # store the time for each chunk
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now)
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  time_it = TRUE
+)
+```
+
+ Directories and Colors
+```{r, colors}
+# Define custom colors for plots
+my_colors <- c("#802268FF", "#006400", "#525ecc99", "#1f0fdf99", "#480607", "#D55E00", 
+               "#164194FF", "#7E6148FF", "#ADB6B6FF", "#52a7cc99", "#F0E685FF", "#cc52c099", 
+               "#6acc5299", "#DC143C", "#802268FF", "#ffbb78", "#3C548899", "#189b3699", 
+               "#cc9b5299", "#1f0fdf99", "#ccebc5", "#42857599", "#868686FF", "#006400", 
+               "#0A47FFFF", "#3B1B53FF", "#749B58FF", "#ccc05299", "#cc765299", "#1B1919FF", 
+               "#00D68FFF", "#14FFB1FF", "#3C5488FF", "#8F7700FF", "#164194FF", "#0094CDFF", 
+               "#FFDAB9", "#FF00FF", "#00FFFF", "green", "blue", "#480607")
+
+# Define file paths for data storage and output
+rds_path_vst <- "/vast/projects/aml_multiome/Sn_vs_SC/rds_path_vst/"
+fig_path_stnx <- "/home/users/allstaff/ghamsari.r/seurat_figures/Sn_vs_SC_V4/"
+```
+
+
+# Loading Required Packages
+```{r pkgs}
+# Script identifier for file naming
+script_title <- "05_Cell_annotation_merged_objects"
+# Load necessary libraries
+pkgs <- c("ggalluvial", "ggplot2", "dplyr", "viridis", "tidyr", "scales", "Seurat", "Azimuth", "SeuratData",
+ "pheatmap", "future", "future.apply", "harmony", "Signac", "BiocParallel", "scCustomize", "gridExtra", "parallel", 
+ "clustree", "RColorBrewer", "patchwork", "igraph", "tibble", "biomaRt", "reshape2", "grid", "tidyverse")
+
+# Load all packages silently
+invisible(lapply(pkgs, library, character.only = TRUE))
+# Save session information for reproducibility
+sink(file.path(fig_path_stnx, paste0(script_title, "_sessionInfo.txt")))
+sessionInfo()
+sink()
+```
+
+# Reading data
+```{r, reading objects}
+merged_obj <- readRDS(paste0(rds_path_vst, "04_Merge_object_outlier_removed_SoupX_corrected_gene_annotations_list_22_samples_11sn_11sc.rds"))
+```
+# Gene Filtering and Subsetting
+To remove sample specific genes
+```{r, fig.width=30}
+# Obtain gene coordinates (example for specific genes)
+ ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl" )
+
+pages = attributePages(ensembl)
+filters = listAttributes(ensembl)
+#########  chrX
+chrX_genes <- getBM(
+  attributes = c('hgnc_symbol', 'chromosome_name', 'start_position','end_position'),
+  filters = 'chromosome_name',
+  values = 'X',
+  mart = ensembl
+)
+
+chrX_genes <- chrX_genes$hgnc_symbol
+length(chrX_genes) #2956
+
+########## chr Y
+chrY_genes <- getBM(
+  attributes = c('hgnc_symbol', 'chromosome_name', 'start_position','end_position'),
+  filters = 'chromosome_name',
+  values = 'Y',
+  mart = ensembl
+)
+
+chrY_genes <- chrY_genes$hgnc_symbol
+length(chrY_genes) #680
+
+all_genes_name <- rownames(merged_obj@assays$RNA)
+length(all_genes_name) #36601
+# Define pattern-based gene exclusions
+removing_genes_patterns <- "^IGHV|^IGKV|^IGLV|^TRAV|^TRBV|^TRDV|^TRGV|^HB[^(P)]|MALAT1|^RP[SL]|^IG[HKL][A-Z0-9-]*|^MT-"
+removing_genes <- grep(removing_genes_patterns, all_genes_name, value = TRUE)
+length(removing_genes) #680
+# Preserve important genes that might match exclusion patterns
+important_genes <- c("IGF1", "IGF2", "IGF1R")
+remaining_genes <- intersect(removing_genes, important_genes) #0
+# Compile final gene exclusion list
+genes_to_remove <- unique(c(chrX_genes, chrY_genes, removing_genes))
+length(genes_to_remove) #2991
+
+length(intersect(all_genes_name,genes_to_remove)) #1681
+
+residual_genes <- all_genes_name[!all_genes_name %in% genes_to_remove]
+length(residual_genes) #34920
+merged_obj <- subset(merged_obj, features = residual_genes)
+cat("Final gene count:", nrow(merged_obj), "\n") #34920 features across 172055 samples within 1 assay 
+```
+# Dimensionality Reduction and Normalization
+## Cell Cycle Scoring and Data Processing
+```{r, fig.width=20, fig.height=20}
+# Prepare cell cycle gene lists
+s.genes <- Seurat::cc.genes$s.genes
+g2m.genes <- Seurat::cc.genes$g2m.genes
+g2m.genes <- setdiff(g2m.genes, setdiff(g2m.genes, rownames(merged_obj)))
+s.genes <- setdiff(s.genes, setdiff(s.genes, rownames(merged_obj)))
+DefaultAssay(merged_obj) <- "RNA" # Set default assay and join layers for compatibility
+merged_obj_joined<- JoinLayers(merged_obj, overwrite = TRUE) #have to joint layers as CellCycleScoring did not work with layers.
+merged_obj <-  NormalizeData(merged_obj_joined, assay="RNA") 
+##Cell-Cycle Scoring and Regression https://satijalab.org/seurat/articles/cell_cycle_vignette
+merged_obj <- Seurat::CellCycleScoring(merged_obj, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+merged_obj@meta.data$CellCycle.Difference <- merged_obj@meta.data$S.Score - merged_obj@meta.data$G2M.Score
+# Standard processing pipeline
+merged_obj <- FindVariableFeatures(merged_obj, selection.method = "vst", nfeatures= 3000, assay="RNA")
+merged_obj <-  ScaleData(merged_obj, assay="RNA",  vars.to.regress = "CellCycle.Difference") 
+merged_obj <- RunPCA(merged_obj, reduction.name='pca_vst_std', reduction.key = "pca_vst_std_PC_",assay = "RNA" )
+merged_obj <- RunUMAP(merged_obj,dims = 2:40, reduction = 'pca_vst_std',  reduction.name = "umap.pca_vst_std")
+# SCTransform processing for comparison
+###### umap of sctransform looks similar to pca so there was no issue with normalizataion
+merged_obj <- SCTransform (merged_obj, vst.flavor = "v2", verbose = FALSE, new.assay.name = "SCT_v2", seed.use = 1448145)
+merged_obj <- RunPCA(merged_obj, reduction.name = 'pca_sct', assay = "SCT_v2")
+merged_obj <- RunUMAP(merged_obj,dims = 2:40, reduction = 'pca_sct',  reduction.name = "umap.pca_sct")
+# Save intermediate results
+saveRDS(merged_obj@reductions, paste0(rds_path_vst, "05_reductions_merged_sn_sc_v2.rds"))
+saveRDS(merged_obj@graphs, paste0(rds_path_vst, "05_graphs__reductions_merged_sn_sc_v2.rds"))
+
+# Initial visualization
+DimPlot(merged_obj, reduction = 'umap.pca_sct', group.by= "cell_type_fine", cols = my_colors)
+DimPlot(merged_obj, reduction = 'umap.pca_sct', group.by= "Platform")
+DimPlot(merged_obj, reduction = 'umap.pca_sct', group.by= "sample_id")
+FeaturePlot(merged_obj, reduction = 'umap.pca_vst_std', features = "nCount_RNA" , min.cutoff = "q20", max.cutoff = "q80")
+table(merged_obj$Platform)
+# scRNA snRNA 
+# 91633 80422 
+```
+## Batch effect removal
+```{r}
+# Apply Harmony for batch effect correction across samples
+merged_obj <- RunHarmony(object = merged_obj, group.by.vars = 'sample_id', reduction = 'pca_vst_std', assay.use = 'RNA', project.dim = FALSE,  n.seed = 1, reduction.save = "harmony_RNA") #Harmony converged after 7 iterations
+merged_obj <- RunUMAP(merged_obj,dims = 2:40, reduction = 'harmony_RNA',  reduction.name = "umap.harmony_RNA_2_40")
+merged_obj <- RunUMAP(merged_obj,dims = 1:50, reduction = 'harmony_RNA',  reduction.name = "umap.harmony_RNA_1_50")
+# Save intermediate results
+saveRDS(merged_obj@reductions, paste0(rds_path_vst, "05_reductions_merged_sn_sc.rds"))
+saveRDS(merged_obj@graphs, paste0(rds_path_vst, "05_graphs__reductions_merged_sn_sc.rds"))
+```
+## Multi-Resolution Clustering 
+```{r, fig.width=30, fig.height=20}
+merged_obj <- FindNeighbors(merged_obj, dims = c(1:50), reduction = "harmony_RNA",assay = "RNA")
+
+# To identify the number of available cores
+num_cores <- parallelly::availableCores() #56
+plan(multisession, workers = num_cores - 4)
+
+resolutions <- unique(c(0.001, 0.0025 ,seq(0.005, 0.1, 0.01), seq(0.1, 1.5, 0.2), seq(2, 3, 0.5)))
+# Perform multi-resolution clustering
+merged_obj <- Seurat:::FindClusters(
+    object = merged_obj, 
+    verbose = TRUE, 
+    resolution = resolutions,  
+  )
+# Save intermediate results
+saveRDS(merged_obj@meta.data, paste0(rds_path_vst, "05_clustering_result_harmoney.rds"))
+# merged_obj@meta.data <- readRDS(paste0(rds_path_vst, "05_clustering_result_harmoney.rds"))
+```
+## Clustree Visualization
+```{r, }
+clustree_plot <- clustree(merged_obj, prefix = "RNA_snn_res.", node_alpha = 0.5) +
+    scale_color_manual(values = my_colors) +
+    guides(color = guide_legend(ncol = 2)) +
+    ggtitle("22 sn sc")
+
+# Specify the PDF file name
+pdf_file <- paste0(fig_path_stnx, "05_Clustree_harmoney_corrected_clustering_172055.pdf")
+pdf(pdf_file, width = 18, height = 30)
+print(clustree_plot)
+dev.off()
+```
+
+# External Cell Type Annotations
+Integration of Published Cell Type Labels from Luecken et al. study as independent cell type annotations
+```{r}
+##############################################################
+############################################## # Process Cite-seq metadata
+##############################################################
+meta_data_merged <- merged_obj@meta.data
+meta_data_merged$barcode <-  rownames(meta_data_merged)
+metadata_path <- "/stornext/General/data/user_managed/grpu_mritchie_1/reza/projects/mat_seq/RaCHseq_AML/BMMC_Public_Data/"
+# Load the metadata cite-seq
+meta_data_cite <- read.csv(paste0(metadata_path, "GSE194122_openproblems_neurips2021_cite_BMMC_processed_obs.csv"))
+dim(meta_data_cite) #90261    27
+unique(meta_data_cite$batch)
+
+# Create sample ID mapping for CITE-seq data
+cell_batch_mapping <- c(
+  "s1d1" = "S1_D1_cell", "s1d2" = "S1_D2_cell", "s1d3" = "S1_D3_cell",
+  "s2d1" = "S2_D1_cell", "s2d4" = "S2_D4_cell", "s2d5" = "S2_D5_cell",
+  "s3d1" = "S3_D1_cell", "s3d6" = "S3_D6_cell", "s3d7" = "S3_D7_cell",
+  "s4d1" = "S4_D1_cell", "s4d8" = "S4_D8_cell", "s4d9" = "S4_D9_cell"
+)
+
+# Add a new sample_id column to meta_data_lueken for merging
+meta_data_cite <- meta_data_cite %>%
+  mutate(
+    sample_id = cell_batch_mapping[batch],
+    barcode = mapply(function(x, sample_id) {
+      base <- sub("-[0-9]+-.*|-.*", "", x)
+      paste0(base, "-", sample_id)
+    }, X, sample_id)
+  )
+
+head(meta_data_cite$barcode)
+############
+############
+
+length(intersect(meta_data_cite$barcode,meta_data_merged$barcode)) #73443
+length(setdiff(meta_data_cite$barcode, meta_data_merged$barcode)) #16818
+table(is.na(meta_data_cite$sample_id))
+##############################################################
+############################################## # Process Multiome metadata
+##############################################################
+meta_data_mutltiome <- read.csv(paste0(metadata_path, "GSE194122_openproblems_neurips2021_multiome_BMMC_processed_obs.csv"))
+dim(meta_data_mutltiome) #69249    29
+unique(meta_data_mutltiome$batch)
+
+
+
+# Create sample ID mapping for Multiome data
+nuclei_batch_mapping <- c(
+  "s1d1" = "S1_D1_Nuclei", "s1d2" = "S1_D2_Nuclei", "s1d3" = "S1_D3_Nuclei",
+  "s2d1" = "S2_D1_Nuclei", "s2d4" = "S2_D4_Nuclei", "s2d5" = "S2_D5_Nuclei",
+  "s3d10" = "S3_D10_Nuclei", "s3d3" = "S3_D3_Nuclei", "s3d6" = "S3_D6_Nuclei",
+  "s3d7" = "S3_D7_Nuclei", "s4d1" = "S4_D1_Nuclei", "s4d8" = "S4_D8_Nuclei",
+  "s4d9" = "S4_D9_Nuclei"
+)
+
+# Add a new column to meta_data_lueken for merging
+meta_data_multiome <- meta_data_multiome %>%
+  mutate(
+    sample_id = nuclei_batch_mapping[batch],
+    barcode = mapply(function(x, sample_id) {
+      base <- sub("-[0-9]+-.*|-.*", "", x)
+      paste0(base, "-", sample_id)
+    }, X, sample_id)
+  )
+
+
+############
+############
+length(intersect(meta_data_mutltiome$barcode,meta_data_merged$barcode)) #54886
+length(setdiff(meta_data_mutltiome$barcode, meta_data_merged$barcode))  #14363
+setdiff(colnames(meta_data_mutltiome), colnames(meta_data_cite)) 
+setdiff(colnames(meta_data_cite),colnames(meta_data_mutltiome))
+table(is.na(meta_data_mutltiome$sample_id))
+##############################################################
+############################################## Merging Multiome and Cite-seq metadata
+##############################################################
+# Combine and filter metadata
+combined_metadata <- bind_rows(meta_data_mutltiome, meta_data_cite)
+dim(combined_metadata) #159510     37
+
+table(combined_metadata$cell_type, combined_metadata$Modality) #The cell type labels are inconsistent across platforms, which they should not be.. ! I should reannotate all of them again.
+table(is.na(combined_metadata$sample_id)) #all false
+##############################################################
+############################################## sub-setting merged public metadata to 22 samples
+##############################################################
+setdiff(unique(combined_metadata$sample_id), unique(meta_data_merged$sample_id)) #3samples which didnt have pair sample and I removed them from my analysis
+sample_ids <- unique(meta_data_merged$sample_id)
+combined_metadata <- combined_metadata[combined_metadata$sample_id %in% sample_ids, ]
+dim(combined_metadata) # 138883     37
+
+length(setdiff(combined_metadata$barcode, meta_data_merged$barcode)) #10554 these cells was removed in our analysis(probably did not pass qc)
+length(setdiff(meta_data_merged$barcode,combined_metadata$barcode)) #43726 these cells was removed in their analysis(probably did not pass qc)
+##############################################################
+############################################## sub-setting merged public metadata based on Seurat object cell barcodes
+##############################################################
+combined_metadata_subset <- combined_metadata %>%
+ dplyr::filter(barcode %in% meta_data_merged$barcode)
+dim(combined_metadata_subset) #128329     37
+
+##############################################################
+############################################## creating merged metadata for Seurat object
+##############################################################
+dim(meta_data_merged) #172055     25    
+intersect(colnames(meta_data_merged), colnames(combined_metadata_subset)) # "sample_id" "Site" "barcode" 
+combined_metadata_subset$sample_id <- NULL
+combined_metadata_subset$Site <- NULL
+final_merged_data <- meta_data_merged %>%
+  left_join(combined_metadata_subset, by = "barcode")
+dim(final_merged_data) # 172055     61
+rownames(final_merged_data) <- final_merged_data$barcode
+identical(rownames(final_merged_data), rownames(merged_obj@meta.data)) #true
+identical(final_merged_data$sample_id, merged_obj@meta.data$sample_id) #true
+# table(final_merged_data$cell_type, useNA = "ifany")
+merged_obj$cell_type_luke <- final_merged_data$cell_type
+merged_obj$DonorGender <- final_merged_data$DonorGender
+merged_obj$DonorRace <- final_merged_data$DonorRace
+merged_obj$DonorAge <- final_merged_data$DonorAge
+merged_obj$DonorSmoker <- final_merged_data$DonorSmoker
+merged_obj$Ethnicity <- final_merged_data$Ethnicity
+merged_obj$DonorBloodType <- final_merged_data$DonorBloodType
+cat("External annotations integrated successfully\n")
+
+#5male and 4 female
+```
+
+# Composition Analysis with Heatmaps
+Generate composition heatmaps for different clustering resolutions
+     
+```{r, fig.width=30, fig.height=30}
+colGEX <- c(  "white", "#CC6677" , "#CC6677", "#6699CC","#6699CC","#6699CC","#6699CC" )
+pdf_file <- paste0(fig_path_stnx, "05_pheatmap_merged_object_luke_celltype_vs_clustering_result_res0_3.pdf")
+pdf(pdf_file, width = 30, height = 10)
+#==============================
+#==============================                                                                     
+Composition_Data_cell_type <- as.matrix(prop.table(table(merged_obj@meta.data$cell_type_luke,merged_obj@meta.data$RNA_snn_res.0.3,useNA = "ifany"),  margin = 2)*100)
+pheatmap(Composition_Data_cell_type, color = colGEX,
+                 cluster_rows = FALSE, cutree_cols = 2,
+                 display_numbers = TRUE,  angle_col = 315,
+                 width = 8, height = 15, main= "df" , fontsize=10 , fontsize_number =  15, number_format="%.0f", cluster_cols = FALSE, number_color = "black")
+#==============================
+#==============================   
+Composition_Data_cell_type <- as.matrix(prop.table(table(merged_obj@meta.data$sample_id,merged_obj@meta.data$RNA_snn_res.0.3,useNA = "ifany"),  margin = 2)*100)
+pheatmap(Composition_Data_cell_type, color = colGEX,
+                 cluster_rows = FALSE, cutree_cols = 2,
+                 display_numbers = TRUE,  angle_col = 315,
+                 width = 8, height = 15, main= "df" , fontsize=10 , fontsize_number =  15, number_format="%.0f", cluster_cols = FALSE, number_color = "black") 
+#==============================
+#============================== 
+Composition_Data_cell_type <- as.matrix(prop.table(table(merged_obj@meta.data$Platform,merged_obj@meta.data$RNA_snn_res.0.3,useNA = "ifany"),  margin = 2)*100)
+pheatmap(Composition_Data_cell_type, color = colGEX,
+                 cluster_rows = FALSE, cutree_cols = 2,
+                 display_numbers = TRUE,  angle_col = 315,
+                 width = 8, height = 15, main= "df" , fontsize=10 , fontsize_number =  15, number_format="%.0f", cluster_cols = FALSE, number_color = "black") 
+#==============================
+#============================== 
+Composition_Data_cell_type <- as.matrix(prop.table(table(merged_obj@meta.data$Site,merged_obj@meta.data$RNA_snn_res.0.3,useNA = "ifany"),  margin = 2)*100)
+pheatmap(Composition_Data_cell_type, color = colGEX,
+                 cluster_rows = FALSE, cutree_cols = 2,
+                 display_numbers = TRUE,  angle_col = 315,
+                 width = 8, height = 15, main= "df" , fontsize=10 , fontsize_number =  15, number_format="%.0f", cluster_cols = FALSE, number_color = "black") 
+
+dev.off()
+
+
+
+pdf_file <- paste0(fig_path_stnx, "05_pheatmap_merged_object_luke_celltype_vs_clustering_result_res_1.5.pdf")
+pdf(pdf_file, width = 30, height = 10)
+#==============================
+#==============================                                                                               
+Composition_Data_cell_type <- as.matrix(prop.table(table(merged_obj@meta.data$cell_type_luke,merged_obj@meta.data$RNA_snn_res.1.5,useNA = "ifany"),  margin = 2)*100)
+pheatmap(Composition_Data_cell_type, color = colGEX,
+                 cluster_rows = FALSE, cutree_cols = 2,
+                 display_numbers = TRUE,  angle_col = 315,
+                 width = 8, height = 15, main= "df" , fontsize=10 , fontsize_number =  15, number_format="%.0f", cluster_cols = FALSE, number_color = "black")
+#==============================
+#============================== 
+Composition_Data_cell_type <- as.matrix(prop.table(table(merged_obj@meta.data$sample_id,merged_obj@meta.data$RNA_snn_res.1.5,useNA = "ifany"),  margin = 2)*100) 
+pheatmap(Composition_Data_cell_type, color = colGEX,
+                 cluster_rows = FALSE, cutree_cols = 2,
+                 display_numbers = TRUE,  angle_col = 315,
+                 width = 8, height = 15, main= "df" , fontsize=10 , fontsize_number =  15, number_format="%.0f", cluster_cols = FALSE, number_color = "black") 
+
+#==============================
+#============================== 
+Composition_Data_cell_type <- as.matrix(prop.table(table(merged_obj@meta.data$Platform,merged_obj@meta.data$RNA_snn_res.1.5,useNA = "ifany"),  margin = 2)*100)
+pheatmap(Composition_Data_cell_type, color = colGEX,
+                 cluster_rows = FALSE, cutree_cols = 2,
+                 display_numbers = TRUE,  angle_col = 315,
+                 width = 8, height = 15, main= "df" , fontsize=10 , fontsize_number =  15, number_format="%.0f", cluster_cols = FALSE, number_color = "black") 
+#==============================
+#==============================   
+Composition_Data_cell_type <- as.matrix(prop.table(table(merged_obj@meta.data$Site,merged_obj@meta.data$RNA_snn_res.1.5,useNA = "ifany"),  margin = 2)*100)
+pheatmap(Composition_Data_cell_type, color = colGEX,
+                 cluster_rows = FALSE, cutree_cols = 2,
+                 display_numbers = TRUE,  angle_col = 315,
+                 width = 8, height = 15, main= "df" , fontsize=10 , fontsize_number =  15, number_format="%.0f", cluster_cols = FALSE, number_color = "black") 
+
+dev.off()
+  
+```
+# Marker Gene Analysis
+## dot plot marker genes
+
+```{r}
+# Load cell type marker genes
+rds_path_temp <- "/stornext/General/data/user_managed/grpu_mritchie_1/reza/projects/mat_seq/RaCHseq_AML/seurat_outputs/monosomy7_v3/"
+all_features <-  readRDS(paste0(rds_path_temp, "07_Markers_for_all_cell_types.rds"))
+all_features <- all_features[!grepl("^Van_Galen_", names(all_features))]
+
+# Generate dot plots for marker gene expression
+DefaultAssay(merged_obj) <- "RNA"
+identical(merged_obj@assays$RNA$counts,merged_obj@assays$RNA$data) #FALSE
+Idents(merged_obj) <- merged_obj$RNA_snn_res.0.3
+
+
+pdf_file <- paste0(fig_path_stnx, "05_dot_marker_genes_RNA_cluster_RNA_snn_res.0.3.pdf")
+pdf(pdf_file, width = 10, height = 15)
+ for (f_name in names(all_features)) {
+            f <- all_features[[f_name]]
+  # Create the Dot Plot
+  p_dot <- DotPlot(merged_obj, features = f, 
+                   cols= c( "#CC6677", "#6699CC"), dot.scale= 9, scale.min =0, scale.max = 100) +
+    RotatedAxis() + coord_flip() +
+    ggtitle(paste0(f_name, " markers"))
+  print(p_dot)
+
+}
+
+dev.off()
+
+#========================
+Idents(merged_obj) <- merged_obj$RNA_snn_res.1.5
+pdf_file <- paste0(fig_path_stnx, "05_dot_marker_genes_RNA_cluster_RNA_snn_res.1.5.pdf")
+pdf(pdf_file, width = 15, height = 15)
+ for (f_name in names(all_features)) {
+            f <- all_features[[f_name]]
+  # Create the Dot Plot
+  p_dot <- DotPlot(merged_obj, features = f, 
+                   cols= c( "#CC6677", "#6699CC"), dot.scale= 9, scale.min =0, scale.max = 100) +
+    RotatedAxis() + coord_flip() +
+    ggtitle(paste0(f_name, " markers"))
+  print(p_dot)
+
+}
+
+dev.off()
+
+```
+## Manual Cell Type Assignment
+Based on clustree, pheatmap, dotplot and uMAP visualisations
+```{r}
+table(merged_obj$cell_type_luke, merged_obj$RNA_snn_res.0.3, useNA = "ifany")
+merged_obj$cell_type_0.03<- 
+  ifelse(merged_obj$RNA_snn_res.0.3 == "0", "CD4_T_cells",
+  ifelse(merged_obj$RNA_snn_res.0.3 == "12", "CD4_T_cells",
+         ifelse(merged_obj$RNA_snn_res.0.3 == "18", "B_Cells",
+                  ifelse(merged_obj$RNA_snn_res.0.3 == "4", "B_Cells",
+                         ifelse(merged_obj$RNA_snn_res.0.3 == "9", "Transitianl_B_Cells",
+                                  ifelse(merged_obj$RNA_snn_res.0.3 == "3", "NK_Cells",
+                                         ifelse(merged_obj$RNA_snn_res.0.3 == "2", "CD8_T_cells",
+             ifelse(merged_obj$RNA_snn_res.0.3 == "7", "Reticulocyte", 
+                     ifelse(merged_obj$RNA_snn_res.0.3 == "11", "Normoblast",
+                              ifelse(merged_obj$RNA_snn_res.0.3 == "17", "Plasmablast",
+  ifelse(merged_obj$RNA_snn_res.0.3 == "14", "pDC", 
+         ifelse(merged_obj$RNA_snn_res.0.3 == "13", "Lymph_Prog", 
+  ifelse(merged_obj$RNA_snn_res.0.3 == "5", "Erythroblast",
+           ifelse(merged_obj$RNA_snn_res.0.3 == "8", "HSC", 
+  ifelse(merged_obj$RNA_snn_res.0.3 == "6", "G.M_prog",
+          ifelse(merged_obj$RNA_snn_res.0.3 == "15", "Monocyte_low_qc",
+                  ifelse(merged_obj$RNA_snn_res.0.3 == "16", "CD14_Monocyte",
+                          ifelse(merged_obj$RNA_snn_res.0.3 == "10", "CD16_Monocyte",
+                                 ifelse(merged_obj$RNA_snn_res.0.3 == "1", "CD14_Monocyte",
+         merged_obj$RNA_snn_res.0.3)))))))))))))))))))
+
+
+##=====================
+##=====================
+Idents(merged_obj) <- merged_obj$cell_type_0.03
+unique(merged_obj$cell_type_0.03)
+pdf_file <- paste0(fig_path_stnx, "05_dot_marker_genes_RNA_celltype_RNA_snn_res.0.3.pdf")
+pdf(pdf_file, width = 10, height = 15)
+ for (f_name in names(all_features)) {
+            f <- all_features[[f_name]]
+  # Create the Dot Plot
+  p_dot <- DotPlot(merged_obj, features = f, 
+                   cols= c( "#CC6677", "#6699CC"), dot.scale= 11, scale.min =0, scale.max = 100) +
+    RotatedAxis() + coord_flip() +
+    ggtitle(paste0(f_name, " markers"))
+  print(p_dot)
+
+}
+
+# Close the PDF device
+dev.off()
+
+
+
+# Create fine and broad cell type categories
+merged_obj$cell_type_fine <- ifelse(merged_obj$cell_type_0.03 == "Monocyte_low_qc", "CD14_Monocyte",
+         merged_obj$cell_type_0.03)
+
+
+
+merged_obj$cell_type_broad<- 
+  ifelse(merged_obj$cell_type_0.03 == "CD4_T_cells", "T_cells",
+         ifelse(merged_obj$cell_type_0.03 == "Transitianl_B_Cells", "B_Cells",
+                  ifelse(merged_obj$cell_type_0.03 == "NK_Cells", "NK_Cells",
+                         ifelse(merged_obj$cell_type_0.03 == "CD8_T_cells", "T_cells",
+          ifelse(merged_obj$cell_type_0.03 == "Monocyte_low_qc", "Monocytes",
+                  ifelse(merged_obj$cell_type_0.03 == "CD14_Monocyte", "Monocytes",
+                          ifelse(merged_obj$cell_type_0.03 == "CD16_Monocyte", "Monocytes",
+                                 ifelse(merged_obj$cell_type_0.03 == "CD16_Monocyte", "Monocytes",
+         merged_obj$cell_type_0.03))))))))
+##Monocyte_low_qc has lower number of counts for RNA however this cluster is dominant by snRNAseq cells, and it is not sample specific, which needs further investigation!
+table(merged_obj$cell_type_mains, merged_obj$cell_type_0.03 ,useNA = "ifany")
+
+
+lineage_map <- c(
+  "HSC" = "HSC",
+  "G.M_prog" = "Myeloid_Like",
+  "CD14_Monocyte" = "Monocytes",
+  "CD16_Monocyte" = "Monocytes",
+  "Monocyte_low_qc" = "Monocytes",
+  "pDC" = "Lymphoid_Like",
+  "Erythroblast" = "Myeloid_Like",
+  "Normoblast" = "Myeloid_Like",
+  "Reticulocyte" = "Myeloid_Like",
+  "Lymph_Prog" = "Lymphoid_Like",
+  "B_Cells" = "B_Cells",
+  "Transitianl_B_Cells" = "B_Cells",
+  "Plasmablast" = "Lymphoid_Like",
+  "NK_Cells" = "NK_Cells",
+  "CD4_T_cells" = "T_Cells",
+  "CD8_T_cells" = "T_Cells"
+)
+
+# Apply to the Seurat object
+merged_obj@meta.data$cell_type_linage <- lineage_map[as.character(merged_obj$cell_type_0.03)]
+```
+## Color Scheme Definition for each cell type
+```{r}
+cell_type_fine_colors <- c("HSC" = "#ADB6B6FF",
+                      "Erythroblast" = "#A20056FF",
+                      "Reticulocyte" = "#BB0021FF",
+                       "Normoblast" = "#9d183299",
+                        "CD16_Monocyte" = "#F05C3BFF",
+                        "CD14_Monocyte" = "#D55E00",
+                       "G.M_prog" = "#ffbb78",
+                         "Lymph_Prog" = "#802268FF",
+                       "pDC" = "#4A0F5FFF",
+                      "Transitianl_B_Cells" = "#08306B",
+                      "B_Cells" = "#00468B",
+                      "Plasmablast" = "#6699CC",
+                      "NK_Cells" = "#008B45",
+                      "CD4_T_cells" = "#00A087FF",
+                      "CD8_T_cells" = "#91D1C2FF")
+
+setdiff(names(cell_type_fine_colors), unique(merged_obj@meta.data$cell_type_fine)) #0
+custom_order <- names(cell_type_fine_colors)
+
+merged_obj@meta.data$cell_type_fine <- factor(merged_obj@meta.data$cell_type_fine, levels = custom_order)
+# Assign colors in the correct order based on `cell_type_final`
+merged_obj@meta.data$colors_cell_type_fine <- cell_type_fine_colors[as.character(merged_obj@meta.data$cell_type_fine)]
+# Convert colors_cell_type to a factor with levels in custom_order
+merged_obj@meta.data$colors_cell_type_fine <- factor(merged_obj@meta.data$colors_cell_type_fine, 
+                                              levels = cell_type_fine_colors[custom_order])
+length(unique(merged_obj$colors_cell_type_fine))
+
+
+##=====================
+##=====================
+
+cell_type_main_colors <- c("HSC" = "#ADB6B6FF",
+                      "Erythroblast" = "#A20056FF",
+                       "Reticulocyte" = "#BB0021FF",
+                        "Normoblast" = "#9d183299",
+                    "Monocytes" = "#D55E00",
+                      "G.M_prog" = "#ffbb78",
+                         "Lymph_Prog" = "#802268FF",
+                    "pDC" = "#4A0F5FFF",
+                      "B_Cells" = "#00468B",
+                             "Plasmablast" = "#6699CC",
+                      "NK_Cells" = "#008B45",
+                      "T_cells" = "#00A087FF")
+setdiff(names(cell_type_main_colors), unique(merged_obj@meta.data$cell_type_mains)) #0
+custom_order <- names(cell_type_main_colors)
+
+merged_obj@meta.data$cell_type_mains <- factor(merged_obj@meta.data$cell_type_mains, levels = custom_order)
+# Assign colors in the correct order based on `cell_type_final`
+merged_obj@meta.data$colors_cell_type_main <- cell_type_main_colors[as.character(merged_obj@meta.data$cell_type_mains)]
+# Convert colors_cell_type to a factor with levels in custom_order
+merged_obj@meta.data$colors_cell_type_main <- factor(merged_obj@meta.data$colors_cell_type_main, 
+                                              levels = cell_type_main_colors[custom_order])
+
+##=====================
+##=====================
+platform_colors <- c("scRNA" = "#6699CC", "snRNA" = "#CC6677")
+setdiff(names(platform_colors), unique(merged_obj@meta.data$Platform)) #0
+
+merged_obj@meta.data$colors_platform <- platform_colors[as.character(merged_obj@meta.data$Platform)]
+merged_obj@meta.data$colors_platform <- factor(merged_obj@meta.data$colors_platform, 
+                                              levels = platform_colors[names(platform_colors)])
+##=====================
+# Save intermediate results
+saveRDS(merged_obj, paste0(rds_path_vst, "05_Merge_object_cell_types_annotated_clustered_list_22_samples_11sn_11sc.rds"))
+merged_obj <- readRDS(paste0(rds_path_vst, "05_Merge_object_cell_types_annotated_clustered_list_22_samples_11sn_11sc.rds"))
+```
+
+## Automated Cell Type Annotation with Azimuth
+
+```{r}
+# List all available Azimuth references
+refs <- AvailableData()
+InstallData("bonemarrowref")
+
+bonemarrowref <- LoadData("bonemarrowref", "azimuth")
+
+######################################
+###################################### Perform individual-level Azimuth annotation 
+######################################
+merged_obj_list<- SplitObject(merged_obj, split.by = "sample_id")
+new_metadata_list <- list()
+for (sobj_name in names(merged_obj_list)) {
+  # Retrieve the Seurat object
+  sobj <- merged_obj_list[[sobj_name]]
+  sobj <- RunAzimuth(sobj, reference = "bonemarrowref")
+  new_metadata_list[[sobj_name]] <- sobj@meta.data 
+  cat("Processed sample:", sobj_name, "- Complete\n")
+   }
+
+# Save intermediate results
+saveRDS(new_metadata_list, paste0(rds_path_vst, "05_Azimuth_annotations_list_on_split_data.rds"))
+
+
+# Merge Azimuth results back to main object
+merged_metadata <- bind_rows(new_metadata_list)
+merged_metadata <- merged_metadata[colnames(merged_obj), ]
+identical(rownames(merged_obj@meta.data), rownames(merged_obj@meta.data)) #true
+merged_obj@meta.data$predicted.celltype.l1_perIndividual <- merged_metadata$predicted.celltype.l1
+merged_obj@meta.data$predicted.celltype.l2_perIndividual <- merged_metadata$predicted.celltype.l2
+# Save intermediate results
+saveRDS(merged_obj@meta.data, paste0(rds_path_vst, "05_Azimuth_annotations_on_both_merged_and_individual_result.rds"))
+```
+
+# Cell Type Proportion Analysis
+## Violin pair plot
+```{r, with=20}
+df <- merged_obj@meta.data
+total_cells_per_sample <- table(df$sample_id)  # This will return the total number of cells for each sample
+dim(total_cells_per_sample) #22
+
+cell_type_counts <- table(df$sample_id,df$cell_type_fine)
+
+# Make sure the total cell counts are aligned with the samples (columns of cell_type_counts)
+# The total_cells_per_sample must be repeated to match the number of columns in the cell_type_counts
+df$total_cells <- total_cells_per_sample[df$sample_id]
+# Normalize the cell type counts by dividing by the total number of cells in each sample
+prop_df <- sweep(cell_type_counts, 1, unique(df$total_cells), FUN = "/")* 100
+
+#Convert the result to a data frame for easy viewing
+prop_df <- as.data.frame(prop_df)
+
+# Convert rownames to a proper column and apply transformations
+prop_df <- prop_df %>%
+  # Add a column without removing the row names
+  mutate(Sample_name = prop_df$Var1) %>%
+  separate(Sample_name, into = c("Site", "Donor", "Platform"), sep = "_") %>%
+  mutate(
+    Site = str_replace(Site, "S", ""), 
+    Donor = str_replace(Donor, "D", ""),   
+    Platform = ifelse(Platform == "Nuclei", "Sn", "Sc"), 
+    Pair_sample = paste0("S", Site, "_", "D", Donor) 
+  )
+
+
+# Reshape the data so each cell type (Var2) becomes a column
+prop_df_wide <- prop_df %>%
+  pivot_wider(names_from = Var2, values_from = Freq)
+
+prop_df_wide$Site <- as.factor(prop_df_wide$Site)
+prop_df_wide$Donor <- as.factor(prop_df_wide$Donor)
+prop_df_wide$Platform <- as.factor(prop_df_wide$Platform)
+prop_df_wide$Pair_sample <- as.factor(prop_df_wide$Pair_sample)
+
+features <- unique(df$cell_type_fine)
+# features <- unique(df$cell_type_broad)
+# class(features)
+# sapply(prop_df_wide[features], class)
+#djusted width for the PDF
+
+# pdf(file = paste0(fig_path_stnx, "05_violin_paired_cell_type_percentage_cell_type_broad.pdf"), width = 12, height = 16)
+pdf(file = paste0(fig_path_stnx, "05_violin_paired_cell_type_percentage_main_celltypes_fine.pdf"), width = 12, height = 16)
+plots <- list()
+
+for (feature in features) {
+    file.edit <- prop_df_wide %>%
+      dplyr::group_by(Pair_sample) %>%
+      mutate(
+        paired = seq(1:length(Pair_sample)),
+        x_pos = case_when(
+          Platform == "Sc" ~ -0.020,
+          Platform == "Sn" ~ 0.020
+        ),
+        box_pos = case_when(
+          Platform == "Sc" ~ -0.0,
+          Platform == "Sn" ~ 0.0
+        )
+      )
+            # Perform Wilcoxon signed-rank test for paired data
+    test_result <- wilcox.test(file.edit[[feature]] ~ Platform, data = file.edit, paired = TRUE)
+    
+    # Check if p-value is significant (p < 0.05)
+    significance <- ifelse(test_result$p.value < 0.05, "Significant", "Not Significant")
+    p_value <- test_result$p.value
+    
+    color_platform_map <- c("Sc" = "#00468B", "Sn" = "#8B0046")
+    fill_platform_map <- c("Sc" = "#6699CC", "Sn" = "#CC6677")
+
+    plot <- ggplot(data = file.edit, aes_string(x = "0", y = feature)) +
+      introdataviz::geom_split_violin(aes(fill = Platform), alpha = 0.3, trim = FALSE, color = "transparent", width = 0.3, show.legend = FALSE) +
+      geom_line(aes(x = x_pos, group = Pair_sample, color = Site), position = position_dodge(0), alpha = 0.9, size = 0.05) +
+      geom_point(aes(x = x_pos, color = Site, group = paired), alpha =0.85, size = 1.5, shape = 8, position = position_dodge(0)) +
+      geom_boxplot(aes(x = box_pos, fill = Platform), width = 0.025, alpha = 0.4, size = 0.05, fatten = NULL, show.legend = TRUE, outlier.size = 0.5, color = "white",
+                   outlier.color = "gray", outlier.alpha = 0.6) +
+      stat_summary(aes(x = box_pos, fill = Platform, color = Platform), fun.data = "mean_se", geom = "pointrange", show.legend = TRUE,
+                   position = position_dodge(0.025), size = 0.8, alpha = 1) +
+      theme_classic() +
+      theme(
+            axis.text.x = element_blank(),
+            axis.title.x = element_blank(),
+            axis.text.y = element_text(size = 10),
+            plot.title = element_text(size = 15, hjust = 0.5 , face = "bold"),
+            legend.text = element_text(size = 10),
+            legend.title = element_text(size = 10),
+            legend.position = "right",
+            legend.box.background = element_rect(fill = "transparent", color = "transparent")  # Optional: Remove box around legend
+      ) +
+      guides(color = guide_legend(override.aes = list(size = 1, shape = 19)))+
+      guides(fill = FALSE)+
+      scale_fill_manual(values = fill_platform_map) +
+      scale_color_manual(name = "Legends", values = c("1" = "#661100", "2" = "#888888", "3" = "#008B45", "4" = "#D55E00", "Sc" = "#00468B", "Sn" = "#8B0046"),  labels = c("1" = "Lab1","2" = "Lab2", "3" = "Lab3", "4" = "Lab4", "Sc" = "scRNA-seq", "Sn" = "snRNA-seq"))+
+      ggtitle(feature) +
+      theme(plot.title = element_text(size = 14)) +  # Larger title font
+      # Add p-value as subtitle with smaller font
+      labs(subtitle = paste("Wilcoxon signed-rank test; p-value: ", round(p_value, 4))) +
+      theme(plot.subtitle = element_text(size = 10))  # Smaller subtitle font
+    plots[[length(plots) + 1]] <- plot
+    if (length(plots) == 8) {
+        grid.arrange(grobs = plots, ncol = 2, nrow = 4) 
+        plots <- list()  # Reset the plots list
+    } 
+}
+
+# If there are remaining plots after the loop, arrange them on the final page
+if (length(plots) > 0) {
+  grid.arrange(grobs = plots, ncol = 2, nrow = 4)
+} 
+
+dev.off()
+```
+
+
+## Alluvial plot all cells
+
+```{r, fig.width=50, fig.height=10}
+# Load required libraries
+
+custom_order <- levels(merged_obj@meta.data$cell_type_fine)
+
+create_alluvial_plot <- function(merged_obj) {
+  # Prepare data for Alluvial plot
+  sankey_df <- merged_obj@meta.data %>%
+    transmute(
+      Platform = Platform,
+      Donor = sample_id,
+      cell_type = cell_type_fine,
+      colors_cell_type = colors_cell_type_fine
+    )
+  set.seed(42)  #
+
+
+    # Define colors for Platform
+  Platform_colors <- c(
+    "snRNA" = "#94221F",   # Red
+    "scRNA" = "#3194CC"  # Blue
+  )
+
+  # Create a mapping between Donors and Health Conditions
+  donor_Platform_mapping <- sankey_df %>%
+    distinct(Donor, Platform) %>%
+    arrange(Donor)  # Ensures consistent order
+
+  # Define base colors for gradients
+  color_snRNA <- c("#94221F", "#ECD8D8")  # Red gradient
+  color_scRNA <- c("#386cb0", "#C9E3F1")  # Blue gradient
+
+
+  # Generate gradient palettes for each Platform condition
+  color_snRNA_palette <- colorRampPalette(color_snRNA)(sum(donor_Platform_mapping$Platform == "snRNA"))
+  color_scRNA_palette <- colorRampPalette(color_scRNA)(sum(donor_Platform_mapping$Platform == "scRNA"))
+
+
+  # Assign colors to donors based on their platform condition
+  donor_colors <- donor_Platform_mapping %>%
+    group_by(Platform) %>%  # Group by Platform Condition
+    mutate(
+      Donor_Color = case_when(
+        Platform == "snRNA" ~ color_snRNA_palette[row_number()],
+        Platform == "scRNA" ~ color_scRNA_palette[row_number()],
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    ungroup() %>%
+    select(Donor, Donor_Color) %>%
+    deframe()
+
+  # Define the color palette manually (ensure colors match the unique cell types)
+cell_type_colors <- setNames(levels(sankey_df$colors_cell_type), levels(sankey_df$cell_type))
+
+
+  # Merge all colors into one mapping
+  all_colors <- c(Platform_colors, donor_colors, cell_type_colors)
+
+names(all_colors)
+
+sankey_df$Platform <- factor(
+  sankey_df$Platform, 
+  levels = c("snRNA", "scRNA")  # Ensure this order
+)
+
+# Ensure Donor is grouped by Platform Condition and then sorted
+donor_levels <- sankey_df %>%
+  arrange(Platform, Donor) %>%  # Sort donors within each Platform condition
+  distinct(Donor) %>%  # Keep only unique donors
+  pull(Donor)  # Extract sorted donor names as a vector
+
+# Now assign this sorted order as the factor levels for Donor
+sankey_df$Donor <- factor(sankey_df$Donor, levels = donor_levels)
+
+sankey_df$cell_type <- factor(sankey_df$cell_type, levels = custom_order)
+
+  # Generate three separate plots
+   plot <-  ggplot(
+      sankey_df,
+    aes(
+      axis1 = Platform,
+      # axis2 = Donor, #donor_method
+      axis2 = cell_type, #cell to method
+       axis3= Donor, #donor_method
+      fill = cell_type  # Ensures color mapping aligns properly
+      # fill = Donor  # Ensures color mapping aligns properly
+    )
+  ) +
+
+    geom_flow(aes(fill = cell_type), alpha = 0.5,width = 0.2)+
+    # geom_flow(aes(fill = Donor), alpha = 0.5,width = 0.2)+
+
+
+    geom_stratum(aes(fill = factor(..stratum..)), width = 0.2, alpha = 1, na.rm = TRUE, color = NA)+
+
+    scale_fill_manual(
+  values = all_colors, 
+  breaks = c("snRNA", "scRNA", levels(sankey_df$Donor), levels(sankey_df$cell_type)),  
+  na.translate = FALSE
+)+
+
+  guides(
+    shape = guide_legend(order = 1),  # Platform Condition first
+    color = guide_legend(order = 2),  # Donor second
+    fill = guide_legend(order = 3)    # Cell Type last
+  ) +
+    
+    theme_minimal() +
+    theme(
+      legend.position = "right",
+      axis.title = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+      legend.key.height = unit(0.5, 'cm'),  # Reduce legend size
+      legend.key.width = unit(0.5, 'cm'),
+      legend.title = element_blank()  # Remove extra legend title
+    ) +
+    ggtitle("Alluvial Plot: Platform  to Donor to Cell Type")
+  
+  return(plot)
+}
+
+# Example usage:
+plot <- create_alluvial_plot(merged_obj)
+
+# Specify the PDF file name
+# pdf_file <- paste0(fig_path_stnx, "05_Alluvial_plot__all_cells_platform_donor_to_method.pdf")
+# pdf_file <- paste0(fig_path_stnx, "05_Alluvial_plot__all_cells_platform_cell_to_method.pdf")
+pdf_file <- paste0(fig_path_stnx, "05_Alluvial_plot__all_cells_cell_to_donor_to_method.pdf")
+
+# Save the combined plot as a single PDF
+ggsave(pdf_file, plot = plot, width = 25, height = 15)
+
+
+```
+
+## UMAP Visualizations
+```{r}
+dim(merged_obj) #36601 172055
+
+
+
+umap_df <- as.data.frame(merged_obj@reductions$umap.harmony_RNA_2_40@cell.embeddings)
+colnames(umap_df) <- c("UMAP1", "UMAP2")
+
+# Add cell type and health condition information
+umap_df$cell_type <- as.factor(merged_obj@meta.data[["cell_type_fine"]])
+umap_df$Donor <- as.factor(merged_obj@meta.data[["sample_id"]])
+umap_df$colors_cell_type <- merged_obj@meta.data[["colors_cell_type_fine"]]
+# Convert `cell_type` to a factor with the specified order
+# Define the color palette manually (ensure colors match the unique cell types)
+color_mapping <- setNames(levels(umap_df$colors_cell_type), levels(umap_df$cell_type))
+unique(umap_df$cell_type)
+# Create scatter plot
+scatter_plot <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = cell_type)) +
+  geom_point(alpha = 0.6, size = 0.9) +  # Adjust transparency and size for better visualization
+ scale_color_manual(values = color_mapping, guide = guide_legend(override.aes = list(size = 9, alpha = 1))) +  # 
+  labs(title = "All Cell types (172,055 cells)",
+       x = "UMAP Dimension 1",
+       y = "UMAP Dimension 2",
+       color = "Cell Type") +
+  theme_minimal() +  
+  theme(panel.grid = element_blank(),  # Remove background grid
+        axis.ticks = element_blank(), 
+        axis.text = element_blank(), 
+        plot.title = element_text(hjust = 0.5)) 
+# Print the scatter plot
+print(scatter_plot)
+# # Specify the PDF file name
+
+pdf_file <- paste0(fig_path_stnx, "05_umap.harmony_RNA_2_40_merged_22samples_cell_type_fine.pdf")
+# # Save the combined plot as a single PDF
+ggsave(pdf_file, plot = scatter_plot, width = 24, height = 20)
+
+#########################
+#########################
+######################### RNA umap umap.pca_vst_std cell type fine
+#########################
+#########################
+
+umap_df <- as.data.frame(merged_obj@reductions$umap.pca_vst_std@cell.embeddings)
+colnames(umap_df) <- c("UMAP1", "UMAP2")
+
+# Add cell type and health condition information
+umap_df$cell_type <- as.factor(merged_obj@meta.data[["cell_type_fine"]])
+umap_df$Donor <- as.factor(merged_obj@meta.data[["sample_id"]])
+umap_df$colors_cell_type <- merged_obj@meta.data[["colors_cell_type_fine"]]
+# Convert `cell_type` to a factor with the specified order
+# Define the color palette manually (ensure colors match the unique cell types)
+color_mapping <- setNames(levels(umap_df$colors_cell_type), levels(umap_df$cell_type))
+unique(umap_df$cell_type)
+# Create scatter plot
+scatter_plot <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = cell_type)) +
+  geom_point(alpha = 0.6, size = 0.9) +  # Adjust transparency and size for better visualization
+ scale_color_manual(values = color_mapping, guide = guide_legend(override.aes = list(size = 9, alpha = 1))) +  # 
+  labs(title = "All Cell types (172,055 cells)",
+       x = "UMAP Dimension 1",
+       y = "UMAP Dimension 2",
+       color = "Cell Type") +
+  theme_minimal() +  
+  theme(panel.grid = element_blank(),  # Remove background grid
+        axis.ticks = element_blank(), 
+        axis.text = element_blank(), 
+        plot.title = element_text(hjust = 0.5)) 
+# Print the scatter plot
+print(scatter_plot)
+# # Specify the PDF file name
+
+pdf_file <- paste0(fig_path_stnx, "05_umap.pca_vst_std_merged_22samples_cell_type_fine.pdf")
+# # Save the combined plot as a single PDF
+ggsave(pdf_file, plot = scatter_plot, width = 24, height = 20)
+
+
+
+
+
+#########################
+#########################
+######################### RNA umap Site uncorrect
+#########################
+#########################
+umap_df <- as.data.frame(merged_obj@reductions$umap.pca_vst_std@cell.embeddings)
+colnames(umap_df) <- c("UMAP1", "UMAP2")
+
+# Add cell type and health condition information
+umap_df$Site <- as.factor(merged_obj@meta.data[["Site"]])
+
+# Create scatter plot
+scatter_plot <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = Site)) +
+  geom_point(alpha = 0.2, size = 0.5) +  # Adjust transparency and size for better visualization
+ # scale_color_manual(values = my_colors, guide = guide_legend(override.aes = list(size = 9, alpha = 1))) +  # 
+   scale_color_manual(name = "Site", values = c("S1" = "#661100", "S2" = "#888888", "S3" = "#008B45", "S4" = "#164194FF"),  labels = c("S1" = "Lab1","S2" = "Lab2", "S3" = "Lab3", "S4" = "Lab4"), guide = guide_legend(override.aes = list(size = 9, alpha = 1))) +
+  labs(title = "All Cell types (172,055 cells)",
+       x = "UMAP Dimension 1",
+       y = "UMAP Dimension 2",
+       color = "Site") +
+  theme_minimal() +  
+  theme(panel.grid = element_blank(),  # Remove background grid
+        axis.ticks = element_blank(), 
+        axis.text = element_blank(), 
+        plot.title = element_text(hjust = 0.5)) 
+# Print the scatter plot
+print(scatter_plot)
+# # Specify the PDF file name
+
+pdf_file <- paste0(fig_path_stnx, "05_umap.pca_vst_std_merged_22samples_Sites.pdf")
+# #
+# # Save the combined plot as a single PDF
+ggsave(pdf_file, plot = scatter_plot, width = 24, height = 20)
+table(merged_obj@meta.data[["Site"]])
+
+#########################
+#########################
+######################### RNA umap Site
+#########################
+#########################
+umap_df <- as.data.frame(merged_obj@reductions$umap.harmony_RNA_2_40@cell.embeddings)
+colnames(umap_df) <- c("UMAP1", "UMAP2")
+
+# Add cell type and health condition information
+umap_df$Site <- as.factor(merged_obj@meta.data[["Site"]])
+
+# Create scatter plot
+scatter_plot <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = Site)) +
+  geom_point(alpha = 0.2, size = 0.5) +  # Adjust transparency and size for better visualization
+ # scale_color_manual(values = my_colors, guide = guide_legend(override.aes = list(size = 9, alpha = 1))) +  # 
+   scale_color_manual(name = "Site", values = c("S1" = "#661100", "S2" = "#888888", "S3" = "#008B45", "S4" = "#164194FF"),  labels = c("S1" = "Lab1","S2" = "Lab2", "S3" = "Lab3", "S4" = "Lab4"), guide = guide_legend(override.aes = list(size = 9, alpha = 1))) +
+  labs(title = "All Cell types (172,055 cells)",
+       x = "UMAP Dimension 1",
+       y = "UMAP Dimension 2",
+       color = "Site") +
+  theme_minimal() +  
+  theme(panel.grid = element_blank(),  # Remove background grid
+        axis.ticks = element_blank(), 
+        axis.text = element_blank(), 
+        plot.title = element_text(hjust = 0.5)) 
+# Print the scatter plot
+print(scatter_plot)
+# # Specify the PDF file name
+
+pdf_file <- paste0(fig_path_stnx, "05_umap.harmony_RNA_2_40_merged_22samples_Sites.pdf")
+# #
+# # Save the combined plot as a single PDF
+ggsave(pdf_file, plot = scatter_plot, width = 24, height = 20)
+table(merged_obj@meta.data[["Site"]])
+
+#########################
+#########################
+######################### RNA umap Donor_Site uncorrect
+#########################
+#########################
+umap_df <- as.data.frame(merged_obj@reductions$umap.pca_vst_std@cell.embeddings)
+colnames(umap_df) <- c("UMAP1", "UMAP2")
+
+# Add cell type and health condition information
+umap_df$Site <- as.factor(merged_obj@meta.data[["Donor_Site"]])
+
+# Create scatter plot
+scatter_plot <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = Site)) +
+  geom_point(alpha = 0.2, size = 0.5) +  # Adjust transparency and size for better visualization
+ scale_color_manual(values = my_colors, guide = guide_legend(override.aes = list(size = 9, alpha = 1))) +  #
+  labs(title = "All Cell types (172,055 cells)",
+       x = "UMAP Dimension 1",
+       y = "UMAP Dimension 2",
+       color = "Donor&Site") +
+  theme_minimal() +  
+  theme(panel.grid = element_blank(),  # Remove background grid
+        axis.ticks = element_blank(), 
+        axis.text = element_blank(), 
+        plot.title = element_text(hjust = 0.5)) 
+# Print the scatter plot
+print(scatter_plot)
+# # Specify the PDF file name
+
+pdf_file <- paste0(fig_path_stnx, "05_umap.pca_vst_std_merged_22samples_Donor_Site.pdf")
+# #
+# # Save the combined plot as a single PDF
+ggsave(pdf_file, plot = scatter_plot, width = 24, height = 20)
+
+
+#########################
+#########################
+######################### RNA umap Donor_Site correct
+#########################
+#########################
+umap_df <- as.data.frame(merged_obj@reductions$umap.harmony_RNA_2_40@cell.embeddings)
+colnames(umap_df) <- c("UMAP1", "UMAP2")
+
+# Add cell type and health condition information
+umap_df$Site <- as.factor(merged_obj@meta.data[["Donor_Site"]])
+
+# Create scatter plot
+scatter_plot <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = Site)) +
+  geom_point(alpha = 0.2, size = 0.5) +  # Adjust transparency and size for better visualization
+ scale_color_manual(values = my_colors, guide = guide_legend(override.aes = list(size = 9, alpha = 1))) +  #
+  labs(title = "All Cell types (172,055 cells)",
+       x = "UMAP Dimension 1",
+       y = "UMAP Dimension 2",
+       color = "Donor$Site") +
+  theme_minimal() +  
+  theme(panel.grid = element_blank(),  # Remove background grid
+        axis.ticks = element_blank(), 
+        axis.text = element_blank(), 
+        plot.title = element_text(hjust = 0.5)) 
+# Print the scatter plot
+print(scatter_plot)
+# # Specify the PDF file name
+
+pdf_file <- paste0(fig_path_stnx, "05_umap.harmony_RNA_2_40_merged_22samples_Donor_Site.pdf")
+# #
+# # Save the combined plot as a single PDF
+ggsave(pdf_file, plot = scatter_plot, width = 24, height = 20)
+
+
+
+#########################
+#########################
+######################### RNA umap Donor_Site_method uncorrect
+#########################
+#########################
+umap_df <- as.data.frame(merged_obj@reductions$umap.pca_vst_std@cell.embeddings)
+colnames(umap_df) <- c("UMAP1", "UMAP2")
+
+# Add cell type and health condition information
+umap_df$Site <- as.factor(merged_obj@meta.data[["sample_id"]])
+
+# Create scatter plot
+scatter_plot <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = Site)) +
+  geom_point(alpha = 0.2, size = 0.5) +  # Adjust transparency and size for better visualization
+ scale_color_manual(values = my_colors, guide = guide_legend(override.aes = list(size = 9, alpha = 1))) +  #
+  labs(title = "All Cell types (172,055 cells), Uncorrected",
+       x = "UMAP Dimension 1",
+       y = "UMAP Dimension 2",
+       color = "Donor&Site&Method") +
+  theme_minimal() +  
+  theme(panel.grid = element_blank(),  # Remove background grid
+        axis.ticks = element_blank(), 
+        axis.text = element_blank(), 
+        plot.title = element_text(hjust = 0.5)) 
+# Print the scatter plot
+print(scatter_plot)
+# # Specify the PDF file name
+
+pdf_file <- paste0(fig_path_stnx, "05_umap.pca_vst_std_merged_22samples_Donor_Site_method.pdf")
+# #
+# # Save the combined plot as a single PDF
+ggsave(pdf_file, plot = scatter_plot, width = 24, height = 20)
+table(merged_obj@meta.data[["Site"]])
+
+#########################
+#########################
+######################### RNA umap Donor_Site_method correct
+#########################
+#########################
+umap_df <- as.data.frame(merged_obj@reductions$umap.harmony_RNA_2_40@cell.embeddings)
+colnames(umap_df) <- c("UMAP1", "UMAP2")
+
+# Add cell type and health condition information
+umap_df$Site <- as.factor(merged_obj@meta.data[["sample_id"]])
+merged_obj@meta.data$sample_id
+# Create scatter plot
+scatter_plot <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = Site)) +
+  geom_point(alpha = 0.2, size = 0.5) +  # Adjust transparency and size for better visualization
+ scale_color_manual(values = my_colors, guide = guide_legend(override.aes = list(size = 9, alpha = 1))) +  #
+  labs(title = "All Cell types (172,055 cells), corrected",
+       x = "UMAP Dimension 1",
+       y = "UMAP Dimension 2",
+       color = "Donor&Site&Method") +
+  theme_minimal() +  
+  theme(panel.grid = element_blank(),  # Remove background grid
+        axis.ticks = element_blank(), 
+        axis.text = element_blank(), 
+        plot.title = element_text(hjust = 0.5)) 
+# Print the scatter plot
+print(scatter_plot)
+# # Specify the PDF file name
+
+pdf_file <- paste0(fig_path_stnx, "05_umap.harmony_RNA_2_40_merged_22samples_Donor_Site_method.pdf")
+# #
+# # Save the combined plot as a single PDF
+ggsave(pdf_file, plot = scatter_plot, width = 24, height = 20)
+
+
+#########################
+######################### RNA umap
+#########################
+
+umap_df <- as.data.frame(merged_obj@reductions$umap.harmony_RNA_1_50@cell.embeddings)
+colnames(umap_df) <- c("UMAP1", "UMAP2")
+
+# Add cell type and health condition information
+umap_df$cell_type <- as.factor(merged_obj@meta.data[["cell_type_mains"]])
+umap_df$Platform <- as.factor(merged_obj@meta.data$Platform)
+umap_df$Donor <- as.factor(merged_obj@meta.data[["sample_id"]])
+umap_df$colors_platform <- merged_obj@meta.data[["colors_platform"]]
+# Convert `cell_type` to a factor with the specified order
+# Define the color palette manually (ensure colors match the unique cell types)
+
+color_mapping <- setNames(platform_colors[names(platform_colors)], names(platform_colors))
+
+# Create scatter plot
+scatter_plot <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = Platform)) +
+  geom_point(alpha = 0.6, size = 0.9) +  # Adjust transparency and size for better visualization
+ scale_color_manual(values = color_mapping, guide = guide_legend(override.aes = list(size = 9, alpha = 1))) +  # 
+  labs(title = "All Cell types (172,055 cells)",
+       x = "UMAP Dimension 1",
+       y = "UMAP Dimension 2",
+       color = "Cell Type") +
+  theme_minimal() +  
+  theme(panel.grid = element_blank(),  # Remove background grid
+        axis.ticks = element_blank(), 
+        axis.text = element_blank(), 
+        plot.title = element_text(hjust = 0.5)) 
+# Print the scatter plot
+print(scatter_plot)
+# # Specify the PDF file name
+
+pdf_file <- paste0(fig_path_stnx, "05_umap.harmony_RNA_1_50_merged_22samples_platform.pdf")
+# #
+# # Save the combined plot as a single PDF
+ggsave(pdf_file, plot = scatter_plot, width = 24, height = 20)
+#########################
+#########################
+######################### RNA umap
+#########################
+#########################
+umap_df <- as.data.frame(merged_obj@reductions$umap.harmony_RNA_2_40@cell.embeddings)
+colnames(umap_df) <- c("UMAP1", "UMAP2")
+
+# Add cell type and health condition information
+umap_df$cell_type <- as.factor(merged_obj@meta.data[["cell_type_mains"]])
+umap_df$Platform <- as.factor(merged_obj@meta.data$Platform)
+umap_df$Donor <- as.factor(merged_obj@meta.data[["sample_id"]])
+umap_df$colors_platform <- merged_obj@meta.data[["colors_platform"]]
+# Convert `cell_type` to a factor with the specified order
+# Define the color palette manually (ensure colors match the unique cell types)
+
+color_mapping <- setNames(platform_colors[names(platform_colors)], names(platform_colors))
+
+# Create scatter plot
+scatter_plot <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = Platform)) +
+  geom_point(alpha = 0.6, size = 0.9) +  # Adjust transparency and size for better visualization
+ scale_color_manual(values = color_mapping, guide = guide_legend(override.aes = list(size = 9, alpha = 1))) +  # 
+  labs(title = "All Cell types (172,055 cells)",
+       x = "UMAP Dimension 1",
+       y = "UMAP Dimension 2",
+       color = "Cell Type") +
+  theme_minimal() +  
+  theme(panel.grid = element_blank(),  # Remove background grid
+        axis.ticks = element_blank(), 
+        axis.text = element_blank(), 
+        plot.title = element_text(hjust = 0.5)) 
+# Print the scatter plot
+print(scatter_plot)
+# # Specify the PDF file name
+
+pdf_file <- paste0(fig_path_stnx, "05_umap.harmony_RNA_2_40_merged_22samples_platform.pdf")
+# #
+# # Save the combined plot as a single PDF
+ggsave(pdf_file, plot = scatter_plot, width = 24, height = 20)
+#########################
+#########################
+######################### RNA umap
+#########################
+#########################
+umap_df <- as.data.frame(merged_obj@reductions$umap.pca_vst_std@cell.embeddings)
+colnames(umap_df) <- c("UMAP1", "UMAP2")
+
+# Add cell type and health condition information
+umap_df$cell_type <- as.factor(merged_obj@meta.data[["cell_type_mains"]])
+umap_df$Platform <- as.factor(merged_obj@meta.data$Platform)
+umap_df$Donor <- as.factor(merged_obj@meta.data[["sample_id"]])
+umap_df$colors_platform <- merged_obj@meta.data[["colors_platform"]]
+# Convert `cell_type` to a factor with the specified order
+# Define the color palette manually (ensure colors match the unique cell types)
+
+color_mapping <- setNames(platform_colors[names(platform_colors)], names(platform_colors))
+
+# Create scatter plot
+scatter_plot <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = Platform)) +
+  geom_point(alpha = 0.6, size = 0.9) +  # Adjust transparency and size for better visualization
+ scale_color_manual(values = color_mapping, guide = guide_legend(override.aes = list(size = 9, alpha = 1))) +  # 
+  labs(title = "All Cell types (172,055 cells)",
+       x = "UMAP Dimension 1",
+       y = "UMAP Dimension 2",
+       color = "Cell Type") +
+  theme_minimal() +  
+  theme(panel.grid = element_blank(),  # Remove background grid
+        axis.ticks = element_blank(), 
+        axis.text = element_blank(), 
+        plot.title = element_text(hjust = 0.5)) 
+# Print the scatter plot
+print(scatter_plot)
+# # Specify the PDF file name
+
+pdf_file <- paste0(fig_path_stnx, "05_umap.pca_vst_std_merged_22samples_platform.pdf")
+# #
+# # Save the combined plot as a single PDF
+ggsave(pdf_file, plot = scatter_plot, width = 24, height = 20)
+
+#########################
+#########################
+######################### RNA umap
+#########################
+#########################
+FeaturePlot(merged_obj, reduction = 'umap.pca_vst_std', features = "nCount_RNA" , min.cutoff = "q20", max.cutoff = "q80")
+umap_df <- as.data.frame(merged_obj@reductions$umap.pca_vst_std@cell.embeddings)
+colnames(umap_df) <- c("UMAP1", "UMAP2")
+
+# Add cell type and health condition information
+umap_df$nCount_RNA <- merged_obj@meta.data[["nCount_RNA"]]
+
+# Compute quantiles
+q20 <- quantile(umap_df$nCount_RNA, 0.20, na.rm = TRUE)
+q80 <- quantile(umap_df$nCount_RNA, 0.80, na.rm = TRUE)
+
+# Convert `cell_type` to a factor with the specified order
+# Define the color palette manually (ensure colors match the unique cell types)
+
+# Create scatter plot
+scatter_plot <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = nCount_RNA)) +
+  geom_point(alpha = 0.6, size = 0.9) +  # Adjust transparency and size for better visualization
+ scale_color_gradient(
+    low = "#CC6677", high = "#6699CC",
+    limits = c(q20, q80),
+    oob = squish  # squish outliers to min/max
+  ) +
+  labs(title = "All Cell types (172,055 cells)",
+       x = "UMAP Dimension 1",
+       y = "UMAP Dimension 2",
+       color = "Cell Type") +
+  theme_minimal() +  
+  theme(panel.grid = element_blank(),  # Remove background grid
+        axis.ticks = element_blank(), 
+        axis.text = element_blank(), 
+        plot.title = element_text(hjust = 0.5)) 
+# Print the scatter plot
+print(scatter_plot)
+# # Specify the PDF file name
+
+pdf_file <- paste0(fig_path_stnx, "05_umap.pca_vst_std_merged_22samples_ncount_RNA.pdf")
+# #
+# # Save the combined plot as a single PDF
+ggsave(pdf_file, plot = scatter_plot, width = 24, height = 20)
+
+#########################
+#########################
+######################### RNA umap
+#########################
+#########################
+umap_df <- as.data.frame(merged_obj@reductions$umap.pca_vst_std@cell.embeddings)
+colnames(umap_df) <- c("UMAP1", "UMAP2")
+# Add cell type and health condition information
+umap_df$nFeature_RNA <- merged_obj@meta.data[["nFeature_RNA"]]
+
+# Compute quantiles
+q20 <- quantile(umap_df$nFeature_RNA, 0.20, na.rm = TRUE)
+q80 <- quantile(umap_df$nFeature_RNA, 0.80, na.rm = TRUE)
+
+# Convert `cell_type` to a factor with the specified order
+# Define the color palette manually (ensure colors match the unique cell types)
+
+# Create scatter plot
+scatter_plot <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = nFeature_RNA)) +
+  geom_point(alpha = 0.6, size = 0.9) +  # Adjust transparency and size for better visualization
+ scale_color_gradient(
+    low = "#CC6677", high = "#6699CC",
+    limits = c(q20, q80),
+    oob = squish  # squish outliers to min/max
+  ) +
+  labs(title = "All Cell types (172,055 cells)",
+       x = "UMAP Dimension 1",
+       y = "UMAP Dimension 2",
+       color = "Cell Type") +
+  theme_minimal() +  
+  theme(panel.grid = element_blank(),  # Remove background grid
+        axis.ticks = element_blank(), 
+        axis.text = element_blank(), 
+        plot.title = element_text(hjust = 0.5)) 
+# Print the scatter plot
+print(scatter_plot)
+# # Specify the PDF file name
+
+pdf_file <- paste0(fig_path_stnx, "05_umap.pca_vst_std_merged_22samples_nFeature_RNA.pdf")
+# #
+# # Save the combined plot as a single PDF
+ggsave(pdf_file, plot = scatter_plot, width = 24, height = 20)
+
+
+#########################
+#########################
+######################### RNA umap Azimuth celltype 1 Corrected
+#########################
+#########################
+umap_df <- as.data.frame(merged_obj@reductions$umap.harmony_RNA_2_40@cell.embeddings)
+colnames(umap_df) <- c("UMAP1", "UMAP2")
+
+# Add cell type and health condition information
+umap_df$Site <- as.factor(merged_obj@meta.data[["predicted.celltype.l1"]])
+
+# Create scatter plot
+scatter_plot <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = Site)) +
+  geom_point(alpha = 0.5, size = 0.85) +  # Adjust transparency and size for better visualization
+ scale_color_manual(values = my_colors, guide = guide_legend(override.aes = list(size = 9, alpha = 1))) +  #
+  labs(title = "All Cell types (172,055 cells)",
+       x = "UMAP Dimension 1",
+       y = "UMAP Dimension 2",
+       color = "Azimuth") +
+  theme_minimal() +  
+  theme(panel.grid = element_blank(),  # Remove background grid
+        axis.ticks = element_blank(), 
+        axis.text = element_blank(), 
+        plot.title = element_text(hjust = 0.5)) 
+# Print the scatter plot
+print(scatter_plot)
+# # Specify the PDF file name
+
+pdf_file <- paste0(fig_path_stnx, "05_umap.harmony_RNA_2_40_merged_22samples_Azimuth_1.pdf")
+# #
+# # Save the combined plot as a single PDF
+ggsave(pdf_file, plot = scatter_plot, width = 24, height = 20)
+
+
+
+#########################
+#########################
+######################### RNA umap Azimuth celltype 1  uncorrect
+#########################
+#########################
+umap_df <- as.data.frame(merged_obj@reductions$umap.pca_vst_std@cell.embeddings)
+colnames(umap_df) <- c("UMAP1", "UMAP2")
+
+# Add cell type and health condition information
+umap_df$Site <- as.factor(merged_obj@meta.data[["predicted.celltype.l1"]])
+merged_obj@meta.data$predicted.celltype.l1
+# Create scatter plot
+scatter_plot <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = Site)) +
+  geom_point(alpha = 0.5, size = 0.85) +  # Adjust transparency and size for better visualization
+ scale_color_manual(values = my_colors, guide = guide_legend(override.aes = list(size = 9, alpha = 1))) +  #
+  labs(title = "All Cell types (172,055 cells), Uncorrected",
+       x = "UMAP Dimension 1",
+       y = "UMAP Dimension 2",
+       color = "Azimuth") +
+  theme_minimal() +  
+  theme(panel.grid = element_blank(),  # Remove background grid
+        axis.ticks = element_blank(), 
+        axis.text = element_blank(), 
+        plot.title = element_text(hjust = 0.5)) 
+# Print the scatter plot
+print(scatter_plot)
+# # Specify the PDF file name
+
+pdf_file <- paste0(fig_path_stnx, "05_umap.pca_vst_std_merged_22samples_Azimuth_1.pdf")
+# #
+# # Save the combined plot as a single PDF
+ggsave(pdf_file, plot = scatter_plot, width = 24, height = 20)
+
+
+#########################
+#########################
+######################### RNA umap Azimuth celltype2 corrected
+#########################
+#########################
+
+
+umap_df <- as.data.frame(merged_obj@reductions$umap.harmony_RNA_2_40@cell.embeddings)
+colnames(umap_df) <- c("UMAP1", "UMAP2")
+
+# Add cell type and health condition information
+umap_df$Site <- as.factor(merged_obj@meta.data[["predicted.celltype.l2"]])
+
+# Create scatter plot
+scatter_plot <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = Site)) +
+  geom_point(alpha = 0.5, size = 0.85) +  # Adjust transparency and size for better visualization
+ scale_color_manual(values = my_colors, guide = guide_legend(override.aes = list(size = 9, alpha = 1))) +  #
+  labs(title = "All Cell types (172,055 cells)",
+       x = "UMAP Dimension 1",
+       y = "UMAP Dimension 2",
+       color = "Azimuth") +
+  theme_minimal() +  
+  theme(panel.grid = element_blank(),  # Remove background grid
+        axis.ticks = element_blank(), 
+        axis.text = element_blank(), 
+        plot.title = element_text(hjust = 0.5)) 
+# Print the scatter plot
+print(scatter_plot)
+# # Specify the PDF file name
+
+pdf_file <- paste0(fig_path_stnx, "05_umap.harmony_RNA_2_40_merged_22samples_Azimuth_2.pdf")
+# #
+# # Save the combined plot as a single PDF
+ggsave(pdf_file, plot = scatter_plot, width = 24, height = 20)
+
+
+
+#########################
+#########################
+######################### RNA umap Azimuth2 uncorrect
+#########################
+#########################
+umap_df <- as.data.frame(merged_obj@reductions$umap.pca_vst_std@cell.embeddings)
+colnames(umap_df) <- c("UMAP1", "UMAP2")
+
+# Add cell type and health condition information
+umap_df$Site <- as.factor(merged_obj@meta.data[["predicted.celltype.l2"]])
+merged_obj@meta.data$predicted.celltype.l1
+# Create scatter plot
+scatter_plot <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = Site)) +
+  geom_point(alpha = 0.5, size = 0.85) +  # Adjust transparency and size for better visualization
+ scale_color_manual(values = my_colors, guide = guide_legend(override.aes = list(size = 9, alpha = 1))) +  #
+  labs(title = "All Cell types (172,055 cells), Uncorrected",
+       x = "UMAP Dimension 1",
+       y = "UMAP Dimension 2",
+       color = "Azimuth") +
+  theme_minimal() +  
+  theme(panel.grid = element_blank(),  # Remove background grid
+        axis.ticks = element_blank(), 
+        axis.text = element_blank(), 
+        plot.title = element_text(hjust = 0.5)) 
+# Print the scatter plot
+print(scatter_plot)
+# # Specify the PDF file name
+
+pdf_file <- paste0(fig_path_stnx, "05_umap.pca_vst_std_merged_22samples_Azimuth_2.pdf")
+# #
+# # Save the combined plot as a single PDF
+ggsave(pdf_file, plot = scatter_plot, width = 24, height = 20)
+
+```
+#violin plot QC per each cell type
+
+```{r, fig.width=20}
+
+pdf_file <- paste0(fig_path_stnx, "05_VlnPlot_plot_lib_size_QC_per_cell_type.pdf")
+pdf(pdf_file, width = 30, height = 10)
+VlnPlot(merged_obj, features = "nFeature_RNA", log = TRUE,group.by = "cell_type_0.03", pt.size = 0.1, alpha=0.1, split.by = "Platform", cols = unique(merged_obj$colors_platform))
+VlnPlot(merged_obj, features = "nCount_RNA", log = TRUE,group.by = "cell_type_0.03", pt.size = 0.1, alpha=0.1, split.by = "Platform", cols = unique(merged_obj$colors_platform))
+dev.off()
+
+pdf_file <- paste0(fig_path_stnx, "05_VlnPlot_plot_lib_size_QC_per_RNA_snn_res.0.9.pdf")
+pdf(pdf_file, width = 30, height = 10)
+VlnPlot(merged_obj, features = "nFeature_RNA", log = TRUE,group.by = "RNA_snn_res.0.9", pt.size = 0.1, alpha=0.1, split.by = "Platform", cols = unique(merged_obj$colors_platform))
+VlnPlot(merged_obj, features = "nCount_RNA", log = TRUE,group.by = "RNA_snn_res.0.9", pt.size = 0.1, alpha=0.1, split.by = "Platform", cols = unique(merged_obj$colors_platform))
+dev.off()
+```
+
+#split object QC
+##scatter plot and MAD 
+
+```{r, scatter plot and MAD }
+# merged_obj_list <- SplitObject(merged_obj, split.by = "sample_id")
+
+###made this plot to re-check the plot 04_scatter_plots_visualisation_all_cells_before_subsetting_MAD_6 and see which cells are responsible for seeing two trend in scRNAseq.
+
+scatter_features <- list(c("nCount_RNA", "nFeature_RNA"), c("percent.mt", "percent.malat1") )
+
+features <-  c("nCount_RNA", "nFeature_RNA")
+create_plot <- function(features, sobj, sample_id) {
+  # Extract the actual feature values
+  x_feature <- features[1]
+  y_feature <- features[2]
+  
+  plot_df <- data.frame(
+    x = sobj@meta.data[[x_feature]],
+    y = sobj@meta.data[[y_feature]],
+    cell_type = as.factor(sobj@meta.data[["cell_type_fine"]]),
+    Donor = as.factor(sobj@meta.data[["sample_id"]]),
+    colors_cell_type = sobj@meta.data[["colors_cell_type_fine"]]
+  )
+  
+  # Build color mapping from cell type to its color
+
+  color_mapping <- setNames(levels(plot_df$colors_cell_type ),levels(plot_df$cell_type))
+  
+  # Plot using aes_string (older) or .data[[...]] (preferred if using ggplot2 ≥ 3.4)
+  scatter_plot <- ggplot(plot_df, aes(x = x, y = y, color = cell_type)) +
+    geom_point(alpha = 0.8, size = 0.9) +
+    scale_color_manual(
+      values = color_mapping,
+      guide = guide_legend(override.aes = list(size = 9, alpha = 1))
+    ) +
+    labs(
+      title = paste(sample_id),
+      x = x_feature,
+      y = y_feature,
+      color = "Cell Type"
+    ) +
+    theme_minimal() +
+    theme(panel.background = element_rect(fill = "white"),
+      panel.grid = element_blank(),
+      plot.title = element_text(hjust = 0.5)
+    )
+
+  return(scatter_plot)
+}
+
+# Start a new PDF file for all samples
+pdf(file = paste0(fig_path_stnx, "05_scatter_qc_plot_color_by_cell_type_fine_per_sample_split.pdf"), width = 14, height = 7)
+
+# Loop over all samples
+for (sample_id in samples) {
+  
+  # Extract the current sample object
+  sobj <- merged_obj_list[[sample_id]]
+
+  plots <- list()
+  
+  # Loop over all feature pairs
+  for (features in scatter_features) {
+    
+    # Create the plot for the current feature pair
+    plot <- create_plot(features, sobj, sample_id)
+    # Add the plot to the list
+    plots[[length(plots) + 1]] <- plot
+  }
+  
+  # Arrange and display the plots on one page
+  grid.arrange(grobs = plots, ncol = 2)
+}
+
+dev.off()
+
+```

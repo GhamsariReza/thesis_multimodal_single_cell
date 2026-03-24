@@ -1,0 +1,701 @@
+---
+title: "08_long_bench_samples"
+author: "Reza Ghamsari"
+date: "2025-07-14"
+output: html_document
+---
+## Script Overview
+This script performs ambient RNA correction using SoupX on paired single-cell and single-nucleus RNA-seq samples, generated for the benchmarking project 
+then check the gene length bias in this independent dataset. 
+This dataset preprocessed by Dr. Yupei You for the benchmarking project.
+Reference: 
+You, Yupei, et al. "Benchmarking long-read RNA-sequencing technologies with LongBench: a cross-platform reference dataset profiling cancer cell lines with bulk and single-cell approaches." bioRxiv (2025).
+
+```{r setup, include=FALSE}
+all_times <- list()  # store the time for each chunk
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now)
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  time_it = TRUE
+)
+```
+
+# Define Color Schemes and File Paths
+```{r, colors}
+# Custom color palette for consistent visualization
+my_colors <- unique(c(
+  "#802268FF", "#006400", "#525ecc99", "#1f0fdf99", "#480607", "#D55E00", 
+  "#164194FF", "#7E6148FF", "#ADB6B6FF", "#52a7cc99", "#F0E685FF", "#cc52c099", 
+  "#6acc5299", "#DC143C", "#802268FF", "#ffbb78", "#3C548899", "#189b3699", 
+  "#cc9b5299", "#1f0fdf99", "#ccebc5", "#42857599", "#868686FF", "#006400", 
+  "#0A47FFFF", "#3B1B53FF", "#749B58FF", "#ccc05299", "#cc765299", "#1B1919FF", 
+  "#00D68FFF", "#14FFB1FF", "#3C5488FF", "#8F7700FF", "#164194FF", "#0094CDFF", 
+  "#FFDAB9", "#FF00FF", "#00FFFF", "green", "blue", "#480607"
+))
+
+
+# Define the directory to save the PDF files
+rds_path_vst <- "/vast/projects/aml_multiome/Sn_vs_SC/rds_path_vst/"
+fig_path_stnx <- "/home/users/allstaff/ghamsari.r/seurat_figures/Sn_vs_SC_V4/"
+
+```
+
+
+#Loading Packages
+```{r, pkgs}
+script_title <- "08_long_bench_samples"
+pkgs <- c(
+  "Signac", "Seurat", "ggplot2", "SoupX", "scCustomize", "gridExtra",
+  "parallel", "clustree", "RColorBrewer", "patchwork", "igraph",
+  "tibble", "biomaRt", "reshape2", "dplyr", "grid" , "future" , "future.apply", "stringr")
+# Load all packages silently
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# Save session information for reproducibility
+sink(file.path(fig_path_stnx, paste0(script_title, "_sessionInfo.txt")))
+sessionInfo()
+sink()
+
+```
+
+
+# Creating Seurat Objects
+
+```{r,}
+merged_obj <- readRDS(paste0(rds_path_vst, "05_Merge_object_cell_types_annotated_clustered_list_22_samples_11sn_11sc.rds"))
+# Path to the directory 
+path_to <- "/stornext/General/scratch/handover/ghamsari.r_longbench_sr_sc/"
+
+# Define the base directories
+base_dirs <- rep(path_to, 2)
+# Concatenate the lists
+sample_ids <-  c("ill_sc" , "ill_sn" )
+# Initialize list to store Seurat objects
+sobj_list <- list()
+# Initialize list to store SoupChannel objects
+filtered_count_list <- list()
+raw_count_list <- list()
+# Initialize list to store Seurat objects
+sobj_list <- list()
+# Create Seurat objects for each sample
+for (i in seq_along(sample_ids)) {
+  sample_id <- sample_ids[i]
+  base_dir <- base_dirs[i]
+  file_path <- paste0(base_dir, sample_id, "/outs/")
+  print(file_path)
+  print(paste0("Reading sample: ", sample_id))
+  # Read the data
+  filter_counts <- Read10X_h5(paste0(file_path, "/filtered_feature_bc_matrix.h5"))
+  seurat_obj <- CreateSeuratObject(counts = filter_counts)
+  seurat_obj$sample_id <- sample_id
+
+  # Load features table
+features <- read.table(
+  gzfile(paste0(file_path, "/filtered_feature_bc_matrix/features.tsv.gz")),
+  sep = "\t", header = FALSE, stringsAsFactors = FALSE
+)
+colnames(features) <- c("ensembl_gene_id", "hgnc_symbol", "feature_type")
+seurat_obj@assays$RNA@meta.data$hgnc_symbol_original <- rownames(seurat_obj)
+# Extract RNA assay metadata
+meta_data <- seurat_obj@assays$RNA@meta.data
+
+
+# Merge with features to get Ensembl ID
+meta_data <- meta_data %>%
+  left_join(features[, c("ensembl_gene_id", "hgnc_symbol")],
+            by = c("hgnc_symbol_original" = "hgnc_symbol"))
+meta_data <- meta_data[match(rownames(seurat_obj), meta_data$hgnc_symbol_original), ]
+meta_data$ensembl_gene_id_v2 <- gsub("\\..*$", "",meta_data$ensembl_gene_id) 
+
+#  ensure gene order is maintained
+if(
+identical(meta_data$hgnc_symbol_original, rownames(seurat_obj)) ){#TRUE
+# Update the meta.data in the Seurat object
+seurat_obj@assays$RNA@meta.data <- meta_data
+}
+  
+   sobj_list[[sample_id]] <- seurat_obj
+  
+}
+```
+
+## Reading meta.data clustering annoatations
+
+Load pre-computed clustering results from external files and integrate them into the Seurat objects.
+```{r,}
+# Load necessary library
+library(readr)  # or use `read.table` if needed
+
+# Define the main directory path
+path_to <- "/stornext/General/scratch/handover/ghamsari.r_longbench_cellline_list"
+
+# List subdirectories (e.g., "sc", "sn")
+sub_dirs <- list.dirs(path_to, recursive = FALSE, full.names = TRUE)
+
+# Create an empty list to hold the data
+txt_file_list <- list()
+
+# Loop over each subdirectory and read .txt files
+for (sub_dir in sub_dirs) {
+  # List all .txt files in the subdirectory
+  txt_files <- list.files(sub_dir, pattern = "\\.txt$", full.names = TRUE)
+
+  for (txt_file in txt_files) {
+    # Use the file name (without extension) as a list name
+    file_name <- tools::file_path_sans_ext(basename(txt_file))
+    list_name <- paste0(basename(sub_dir), "_", file_name)
+    
+    # Read the file and store in the list
+    txt_file_list[[list_name]] <- read.table(txt_file, header = FALSE, sep = "\t", stringsAsFactors = FALSE)
+  }
+}
+
+for(file in names(txt_file_list)){
+  df <- txt_file_list[[file]]
+  df$cluster <- file
+  txt_file_list[[file]] <- df
+}
+
+
+# Function to filter and bind list elements by platform prefix
+merge_platform_files <- function(platform_prefix, list_obj) {
+  platform_list <- list_obj[grepl(paste0("^", platform_prefix, "_"), names(list_obj))]
+  
+  # Add a column with source name to each data frame
+  merged_df <- bind_rows(
+    lapply(names(platform_list), function(name) {
+      df <- platform_list[[name]]
+      return(df)
+    })
+  )
+  
+  return(merged_df)
+}
+
+# Merge separately for 'sc' and 'sn'
+merged_sc <- merge_platform_files("sc", txt_file_list)
+merged_sn <- merge_platform_files("sn", txt_file_list)
+head(merged_sc)
+merged_sc$barcode <- paste0(merged_sc$V1,"-1")
+merged_sn$barcode <- paste0(merged_sn$V1,"-1")
+length(merged_sn$barcode) #6361
+length(barcodes_to_keep_sn)
+length(merged_sc$barcode) #3850
+length(intersect(merged_sc$barcode , colnames(sobj_list$ill_sc)))
+
+# Get barcodes to keep
+barcodes_to_keep_sn <- intersect(merged_sn$barcode, colnames(sobj_list$ill_sn))
+
+# Filter the Seurat object
+sobj_list$ill_sn <- subset(sobj_list$ill_sn, cells = barcodes_to_keep_sn)
+
+
+# Get barcodes to keep
+barcodes_to_keep_sc <- intersect(merged_sc$barcode, colnames(sobj_list$ill_sc))
+
+# Filter the Seurat object
+sobj_list$ill_sc <- subset(sobj_list$ill_sc, cells = barcodes_to_keep_sc)
+colnames(merged_sc)
+merged_sc$barcode <- as.character(merged_sc$barcode)
+
+# Subset metadata to matching barcodes only
+cluster_info_sc <- merged_sc[merged_sc$barcode %in% colnames(sobj_list$ill_sc), c("barcode", "cluster")]
+
+# Set rownames to barcodes for merging
+rownames(cluster_info_sc) <- cluster_info_sc$barcode
+# Reorder rows to match the Seurat object
+cluster_info_sc <- cluster_info_sc[colnames(sobj_list$ill_sc), , drop = FALSE]
+identical(rownames(cluster_info_sc), colnames(sobj_list$ill_sc))
+# Add cluster info to metadata
+sobj_list$ill_sc <- AddMetaData(sobj_list$ill_sc, metadata = cluster_info_sc["cluster"])
+#=========================
+merged_sn$barcode <- as.character(merged_sn$barcode)
+
+# Subset metadata to matching barcodes only
+cluster_info_sn <- merged_sn[merged_sn$barcode %in% colnames(sobj_list$ill_sn), c("barcode", "cluster")]
+
+# Set rownames to barcodes for merging
+rownames(cluster_info_sn) <- cluster_info_sn$barcode
+# Reorder rows to match the Seurat object
+cluster_info_sn <- cluster_info_sn[colnames(sobj_list$ill_sn), , drop = FALSE]
+identical(rownames(cluster_info_sn), colnames(sobj_list$ill_sn))
+# Add cluster info to metadata
+sobj_list$ill_sn <- AddMetaData(sobj_list$ill_sn, metadata = cluster_info_sn["cluster"])
+
+```
+
+# Seurat Clustering Analysis
+Perform SCTransform normalization, PCA, and clustering on the Seurat objects using default resolution.
+```{r, clustering}
+length(sobj_list) #2
+
+for (id in names(sobj_list)) {
+  sobj_list[[id]]$sample_id <- id
+}
+
+processSeurat <- function(x) {
+    x <- SCTransform (x, vst.flavor = "v2", verbose = FALSE,new.assay.name = "SCT_soupx", seed.use = 1448145)
+    message("Running PCA...")
+    x <- RunPCA(x, reduction.name= 'pca_soupx', assay = "SCT_soupx")
+    message("Finding Neighbors...")
+    x <- FindNeighbors(x, reduction = 'pca_soupx', dims = 1:50, graph.name='graph_soupx')
+    x <- FindClusters(x, graph.name = "graph_soupx",resolution = 0.8, verbose = FALSE)
+    x@meta.data$soupx_clusters <- x@meta.data$seurat_clusters
+    x@meta.data$seurat_clusters <- NULL
+   soupx_meta.data <- x@meta.data
+    return(soupx_meta.data)
+}
+
+
+# To identify the number of available cores
+num_cores <- parallelly::availableCores() #56
+plan(multisession, workers = num_cores - 3)
+soupx_metadata_list <- future_lapply(sobj_list, processSeurat)
+length(soupx_metadata_list) #2
+saveRDS(soupx_metadata_list, paste0(rds_path_vst, "01_metadata_list_soupx_clustering_22seurat_objects_11sn_11sc.rds"))
+
+for (obj_name in names(sobj_list)) {
+  for (meta_name in names(soupx_metadata_list)) {
+    
+    if (obj_name == meta_name) {
+      print(paste("Matching names:", obj_name == meta_name))
+      sobject <- sobj_list[[obj_name]]
+      soupx_meta_obj <- soupx_metadata_list[[meta_name]]
+      
+      # Check if row names in metadata match column names in Seurat object
+      if (identical(rownames(soupx_meta_obj), colnames(sobject))) {
+        print(paste("identical barcodes:", identical(rownames(soupx_meta_obj), colnames(sobject))))
+
+        sobject$soupx_clusters <- soupx_meta_obj$soupx_clusters
+        sobj_list[[obj_name]] <- sobject
+      }
+      
+      # Display number of unique clusters
+      cluster_table <- table(sobject$soupx_clusters)
+      print(sprintf("For %s, number of clusters found: %d", obj_name, length(unique(sobject$soupx_clusters))))
+
+      # print(cluster_table)
+    }
+  }
+}
+sobj_list <- sobj_list[!sapply(sobj_list, is.null)]
+
+##showing that the number of clusters in scRNA is higher or lower than snRNA?violin plot
+length(sobj_list) #2
+```
+
+## Running Soupx 
+https://rawcdn.githack.com/constantAmateur/SoupX/204b602418df12e9fdb4b68775a8b486c6504fe4/inst/doc/pbmcTutorial.html
+
+```{r}
+features <- as.data.frame(read.table(gzfile("/stornext/General/scratch/handover/ghamsari.r_longbench_sr_sc/ill_sc/outs/filtered_feature_bc_matrix/features.tsv.gz"), sep = "\t", header = FALSE))
+
+# To identify the number of available cores
+num_cores <- parallelly::availableCores() #56
+plan(multisession, workers = num_cores - 4)
+# Obj_name <- "ill_sc"
+# Path to the directory
+base_dir <- "/stornext/General/scratch/handover/ghamsari.r_longbench_sr_sc/"
+# Get the list of all directories within the given directory (samples' name)
+list_of_BMMC_samples <-  c("ill_sc" , "ill_sn" )
+# Run SoupX in parallel over matching sample names
+soupx_results <- future_lapply(names(sobj_list), function(Obj_name) {
+  if (Obj_name %in% list_of_BMMC_samples) {
+    print(Obj_name)
+    print(paste("Matching names:", Obj_name %in% list_of_BMMC_samples))
+    
+    sobj <- sobj_list[[Obj_name]]
+    # print(paste0("readin raw file ", Obj_name))
+    raw <- Read10X(file.path(base_dir, Obj_name, "outs", "raw_feature_bc_matrix"))
+    rna_counts <- Read10X(file.path(base_dir, Obj_name, "outs", "filtered_feature_bc_matrix"))
+
+    identical(rownames(raw), rownames(rna_counts))
+    # print(paste0("Estimating backgroung RNA for ", Obj_name))
+
+    sc <- SoupChannel(raw, rna_counts)
+    sc <- setClusters(sc, sobj@meta.data$soupx_clusters)
+    sc <- autoEstCont(sc, doPlot = FALSE)
+    out <- adjustCounts(sc, roundToInt = TRUE)
+    # print(paste0("Finish running SoupX for", Obj_name))
+
+     return(list(name = Obj_name, counts = out))
+  } else {
+     print(paste("NOT Matching names:", Obj_name %in% list_of_BMMC_samples))
+    return(NULL)  # Return NULL for unmatched names
+  }
+})
+
+
+identical(colnames(sobj), colnames(rna_counts))
+# Filter NULLs
+soupx_results <- Filter(Negate(is.null), soupx_results)
+
+# Convert to a named list
+soupx_list <- setNames(
+  lapply(soupx_results, function(x) x$counts),
+  sapply(soupx_results, function(x) x$name)
+)
+names(soupx_list)
+length(soupx_list) #2
+
+# Initialize list to store Seurat objects
+corrected_list <- list()
+# Create Seurat objects from SoupX-corrected counts
+for (sobj in names(soupx_list)) {
+  soupcount <- soupx_list[[sobj]]
+  seurat_obj <- CreateSeuratObject(counts = soupcount)
+  corrected_list[[sobj]] <- seurat_obj
+}
+my_list <- rownames(merged_obj)
+length(intersect(rownames(raw), rownames(merged_obj) )) #23436
+length(intersect(rownames(raw), features$V2))
+features$V2
+problematic_genes <- setdiff(my_list,rownames(raw))
+cleaned_gene_list <- my_list
+cleaned_gene_list[my_list %in% problematic_genes] <- gsub("\\.1$", "", my_list[my_list %in% problematic_genes])
+length(intersect(rownames(raw), cleaned_gene_list )) #23436
+length(intersect(features$V1 %>%  gsub("\\..*$", "",.), merged_obj@assays$RNA@meta.data$ensembl_gene_id))
+
+saveRDS(corrected_list, paste0(rds_path_vst, "08_SoupX_corrected_Seurat_object_list_22_samples_11sn_11sc.rds"))
+
+```
+# Gene Annotation Harmonization
+Harmonize gene annotations between LongBench samples and reference BMMC dataset
+
+```{r}
+identical(rownames(sobj), sobj@assays$RNA@meta.data$hgnc_symbol_original)
+overlap_Genes <- intersect(gene_meta$ensembl_gene_id, sobj@assays$RNA@meta.data$ensembl_gene_id_v2)
+length(overlap_Genes)
+merged_obj <- readRDS(paste0(rds_path_vst, "05_Merge_object_cell_types_annotated_clustered_list_22_samples_11sn_11sc.rds"))
+gene_meta <- merged_obj@assays$RNA@meta.data
+gene_meta_subset <- gene_meta[gene_meta$ensembl_gene_id %in% overlap_Genes, ]
+dim(gene_meta_subset) #36327
+new_meta <- sobj@assays$RNA@meta.data
+new_meta <- new_meta[new_meta$ensembl_gene_id_v2 %in% gene_meta$ensembl_gene_id, ]
+dim(new_meta) #36327
+overlap_Genes <- new_meta$hgnc_symbol_original
+for (name in names(sobj_list)) {
+   sobj <- sobj_list[[name]]
+   sobj <- subset(sobj, features = overlap_Genes) 
+    sobj_list[[name]] <- sobj
+}
+
+meta_data <- sobj_list$ill_sc@assays$RNA@meta.data
+gene_meta_subset$ensembl_gene_id_v2 <- gene_meta_subset$ensembl_gene_id
+
+meta_data_merged <- meta_data %>%
+  left_join(gene_meta_subset, by = "ensembl_gene_id_v2")
+
+setdiff(rownames(sobj_list$ill_sc), meta_data_merged$hgnc_symbol_original.x)
+meta_data_merged <- meta_data_merged[match(rownames(sobj_list$ill_sc), meta_data_merged$hgnc_symbol_original.x), ]
+identical(rownames(sobj_list$ill_sc), meta_data_merged$hgnc_symbol_original.x) #TRUE
+sobj_list$ill_sc@assays$RNA@meta.data <- meta_data_merged
+identical(rownames(sobj_list$ill_sn), meta_data_merged$hgnc_symbol_original.x) #TRUE
+sobj_list$ill_sn@assays$RNA@meta.data <- meta_data_merged
+
+
+saveRDS(sobj_list, paste0(rds_path_vst, "01_2_samples_list_not_corrected_for_ambient_gene_annotation_cluster.rds"))
+```
+
+# Gene Length Distribution Analysis: per platform
+```{r, final}
+sobj_list$ill_sc$Platform <- "scRNA"
+sobj_list$ill_sn$Platform <- "snRNA"
+# #############
+############ Define the gene length categories
+#############
+sobj_list <- sobj_list_final
+for (obj in names(sobj_list)){
+  sobj <- sobj_list[[obj]]
+  # Step 1: Get the gene row sums across all barcodes (total count per gene)
+  count_matrix <- sobj@assays$RNA$counts
+  nCount_per_gene <- rowSums(count_matrix)
+ if(identical(names(nCount_per_gene), rownames(sobj))) {#TRUE
+ sobj@assays$RNA@meta.data$nCount_per_gene <- nCount_per_gene}
+  sobj_list[[obj]] <- sobj
+}
+
+all_counts <- list()
+
+for (obj in names(sobj_list)) {
+  sobj <- sobj_list[[obj]]
+  platform <- unique(sobj$Platform)
+  gene_df <- sobj@assays$RNA@meta.data
+  gene_df <- gene_df[!is.na(gene_df$gene_length), ]
+
+
+  # Create bins - use fewer bins for clarity, e.g. 100
+  gene_df$length_bin <- cut(
+    gene_df$gene_length,
+    breaks = quantile(gene_df$gene_length, probs = seq(0, 1, length.out = 100)),
+    include.lowest = TRUE
+  )
+
+  counts_by_bin <- gene_df %>%
+  group_by(length_bin) %>%
+  summarise(
+    total_counts = sum(nCount_per_gene),
+    gene_number = n()
+  ) %>%
+  mutate(
+    platform = platform,
+    Sample_id = obj
+  )
+
+  all_counts[[obj]] <- counts_by_bin
+}
+
+# Combine all into one dataframe
+combined_df <- bind_rows(all_counts)
+
+
+scientific_num_pattern <- "[0-9\\.eE\\+\\-]+"
+combined_df <- combined_df %>%
+  mutate(
+    bin_start = as.numeric(str_extract(length_bin, paste0("(?<=\\[|\\()", scientific_num_pattern))),
+    bin_end = as.numeric(str_extract(length_bin, paste0("(?<=,)", scientific_num_pattern, "(?=\\]|\\))"))),
+    bin_mid = (bin_start + bin_end) / 2
+  )
+
+combined_df$bin_mid_factor <- factor(combined_df$bin_mid)
+
+combined_df <- combined_df %>%
+  group_by(Sample_id) %>%
+  mutate(
+    total_counts_per_sample = sum(total_counts),  # Total counts for the entire sample
+    # Normalize within each sample and calculate percentage of total counts per bin
+    percentage_bin_count = (total_counts / total_counts_per_sample) * 100
+  ) %>%
+  ungroup()
+
+
+
+pdf(file = paste0(fig_path_stnx, "08_Distribution_gene_length_2_new_samples_v3_annotated.pdf"), width = 16, height = 10)
+ggplot(combined_df, aes(x = bin_mid_factor, y = percentage_bin_count, color = platform, group = Sample_id)) +
+  geom_line(size = 0.5, alpha = 0.5) +
+  labs(
+    title = "Percentage of Counts per Gene Length Bin Across 2 Paired Samples",
+    x = "Gene Length Bin Midpoint (bp)",
+    y = "Percentage Counts per Bin",
+    color = "Sample"
+  ) +
+  scale_color_manual(values = c("scRNA" = "#00468B", "snRNA" = "#8B0046")) +
+  scale_x_discrete(breaks = levels(combined_df$bin_mid_factor)[seq(1, length(levels(combined_df$bin_mid_factor)), by = 5)])+
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 4),
+     axis.line = element_line(color = "black")
+  )
+
+
+dev.off()
+
+```
+# Gene Length Distribution Analysis
+per_cluster_platform
+```{r, final}
+############
+############ Define the gene length categories
+#############
+
+for (obj in names(sobj_list)){
+  sobj <- sobj_list[[obj]]
+  # Step 1: Get the gene row sums across all barcodes (total count per gene)
+  count_matrix <- sobj@assays$RNA$counts
+  nCount_per_gene <- rowSums(count_matrix)
+ if(identical(names(nCount_per_gene), rownames(sobj))) {#TRUE
+   if(identical(names(nCount_per_gene), sobj@assays$RNA@meta.data$hgnc_symbol_original.x)){
+ sobj@assays$RNA@meta.data$nCount_per_gene <- nCount_per_gene}}
+  sobj_list[[obj]] <- sobj
+}
+
+all_counts <- list()
+
+for (obj in names(sobj_list)) {
+  sobj <- sobj_list[[obj]]
+  platform <- unique(sobj$Platform)
+  gene_df <- sobj@assays$RNA@meta.data
+  gene_df <- gene_df[!is.na(gene_df$gene_length), ]
+
+
+  # Create bins - use fewer bins for clarity, e.g. 100
+  gene_df$length_bin <- cut(
+    gene_df$gene_length,
+    breaks = quantile(gene_df$gene_length, probs = seq(0, 1, length.out = 100)),
+    include.lowest = TRUE
+  )
+
+  counts_by_bin <- gene_df %>%
+  group_by(length_bin) %>%
+  summarise(
+    total_counts = sum(nCount_per_gene),
+    gene_number = n()
+  ) %>%
+  mutate(
+    platform = platform,
+    Sample_id = obj
+  )
+
+  all_counts[[obj]] <- counts_by_bin
+}
+
+# Combine all into one dataframe
+combined_df <- bind_rows(all_counts)
+
+scientific_num_pattern <- "[0-9\\.eE\\+\\-]+"
+combined_df <- combined_df %>%
+  mutate(
+    bin_start = as.numeric(str_extract(length_bin, paste0("(?<=\\[|\\()", scientific_num_pattern))),
+    bin_end = as.numeric(str_extract(length_bin, paste0("(?<=,)", scientific_num_pattern, "(?=\\]|\\))"))),
+    bin_mid = (bin_start + bin_end) / 2
+  )
+
+combined_df$bin_mid_factor <- factor(combined_df$bin_mid)
+
+combined_df <- combined_df %>%
+  group_by(Sample_id) %>%
+  mutate(
+    total_counts_per_sample = sum(total_counts),  # Total counts for the entire sample
+    # Normalize within each sample and calculate percentage of total counts per bin
+    percentage_bin_count = (total_counts / total_counts_per_sample) * 100
+  ) %>%
+  ungroup()
+
+
+
+pdf(file = paste0(fig_path_stnx, "08_Distribution_gene_length_2_new_samples_per_cluster_platform_v4.pdf"), width = 16, height = 10)
+ggplot(combined_df, aes(x = bin_mid_factor, y = percentage_bin_count, color = platform, group = Sample_id)) +
+  geom_line(size = 0.5, alpha = 0.5) +
+  labs(
+    title = "Percentage of Counts per Gene Length Bin Across 2 Paired Samples",
+    x = "Gene Length Bin Midpoint (bp)",
+    y = "Percentage Counts per Bin",
+    color = "Sample"
+  ) +
+   # scale_color_manual(values = my_colors) +
+  scale_color_manual(values = c("scRNA" = "#00468B", "snRNA" = "#8B0046")) +
+  scale_x_discrete(breaks = levels(combined_df$bin_mid_factor)[seq(1, length(levels(combined_df$bin_mid_factor)), by = 5)])+
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 4),
+     axis.line = element_line(color = "black")
+  )
+
+
+dev.off()
+```
+
+# GC Content Distribution Analysis
+```{r, final}
+# #############
+############ Define the gene length categories
+#############
+
+for (obj in names(sobj_list)){
+  sobj <- sobj_list[[obj]]
+  # Step 1: Get the gene row sums across all barcodes (total count per gene)
+  count_matrix <- sobj@assays$RNA$counts
+  nCount_per_gene <- rowSums(count_matrix)
+ if(identical(names(nCount_per_gene), rownames(sobj))) {#TRUE
+   if(identical(names(nCount_per_gene), sobj@assays$RNA@meta.data$hgnc_symbol_original.x)){
+ sobj@assays$RNA@meta.data$nCount_per_gene <- nCount_per_gene}}
+  sobj_list[[obj]] <- sobj
+}
+
+all_counts <- list()
+
+for (obj in names(sobj_list)) {
+  sobj <- sobj_list[[obj]]
+  platform <- unique(sobj$Platform)
+  gene_df <- sobj@assays$RNA@meta.data
+  gene_df <- gene_df[!is.na(gene_df$percentage_gene_gc_content), ]
+
+range(gene_df$percentage_gene_gc_content)
+  # Create bins - use fewer bins for clarity, e.g. 100
+  gene_df$length_bin <- cut(
+    gene_df$percentage_gene_gc_content,
+    breaks = quantile(gene_df$percentage_gene_gc_content, probs = seq(0, 1, length.out = 40)),
+    include.lowest = TRUE
+  )
+
+  counts_by_bin <- gene_df %>%
+  group_by(length_bin) %>%
+  summarise(
+    total_counts = sum(nCount_per_gene),
+    gene_number = n()
+  ) %>%
+  mutate(
+    platform = platform,
+    Sample_id = obj
+  )
+
+  all_counts[[obj]] <- counts_by_bin
+}
+
+# Combine all into one dataframe
+combined_df <- bind_rows(all_counts)
+
+
+scientific_num_pattern <- "[0-9\\.eE\\+\\-]+"
+combined_df <- combined_df %>%
+  mutate(
+    bin_start = as.numeric(str_extract(length_bin, paste0("(?<=\\[|\\()", scientific_num_pattern))),
+    bin_end = as.numeric(str_extract(length_bin, paste0("(?<=,)", scientific_num_pattern, "(?=\\]|\\))"))),
+    bin_mid = (bin_start + bin_end) / 2
+  )
+
+combined_df$bin_mid_factor <- factor(combined_df$bin_mid)
+
+combined_df <- combined_df %>%
+  group_by(Sample_id) %>%
+  mutate(
+    total_counts_per_sample = sum(total_counts),  # Total counts for the entire sample
+    # Normalize within each sample and calculate percentage of total counts per bin
+    percentage_bin_count = (total_counts / total_counts_per_sample) * 100
+  ) %>%
+  ungroup()
+
+
+
+pdf(file = paste0(fig_path_stnx, "08_Distribution_GC_2_new_samples_per_cluster_sample_id_v4.pdf"), width = 16, height = 10)
+ggplot(combined_df, aes(x = bin_mid_factor, y = percentage_bin_count, color = Sample_id, group = Sample_id)) +
+  geom_line(size = 0.5, alpha = 0.5) +
+  labs(
+    title = "Percentage of Counts per gc_content perc Bin Across 2 Paired Samples",
+    x = "percentage_gene_gc_content bin Midpoint (bp)",
+    y = "Percentage Counts per Bin",
+    color = "Sample"
+  ) +
+   scale_color_manual(values = my_colors) +
+  # scale_color_manual(values = c("scRNA" = "#00468B", "snRNA" = "#8B0046")) +
+  scale_x_discrete(breaks = levels(combined_df$bin_mid_factor)[seq(1, length(levels(combined_df$bin_mid_factor)), by = 5)])+
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 4),
+     axis.line = element_line(color = "black")
+  )
+
+
+dev.off()
+
+```
+
+
+

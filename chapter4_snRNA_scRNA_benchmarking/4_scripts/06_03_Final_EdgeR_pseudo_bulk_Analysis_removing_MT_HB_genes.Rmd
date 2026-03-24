@@ -1,0 +1,734 @@
+---
+title: "06_03_Final_EdgeR_pseudo_bulk_Analysis"
+author: "Reza Ghamsari"
+date: "2024-10-11"
+output: html_document
+---
+This script performs comprehensive pseudo-bulk differential expression analysis comparing snRNA-seq and scRNA-seq across different cell types
+using EdgeR.
+!! Because of gene length bias the result of this script are not reliable.
+```{r setup, include=FALSE}
+all_times <- list()  # store the time for each chunk
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now)
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  time_it = TRUE
+)
+```
+
+# Define Color Schemes and File Paths
+```{r, colors}
+# Custom color palette for consistent visualization
+my_colors <- unique(c(
+  "#802268FF", "#006400", "#525ecc99", "#1f0fdf99", "#480607", "#D55E00", 
+  "#164194FF", "#7E6148FF", "#ADB6B6FF", "#52a7cc99", "#F0E685FF", "#cc52c099", 
+  "#6acc5299", "#DC143C", "#802268FF", "#ffbb78", "#3C548899", "#189b3699", 
+  "#cc9b5299", "#1f0fdf99", "#ccebc5", "#42857599", "#868686FF", "#006400", 
+  "#0A47FFFF", "#3B1B53FF", "#749B58FF", "#ccc05299", "#cc765299", "#1B1919FF", 
+  "#00D68FFF", "#14FFB1FF", "#3C5488FF", "#8F7700FF", "#164194FF", "#0094CDFF", 
+  "#FFDAB9", "#FF00FF", "#00FFFF", "green", "blue", "#480607"
+))
+
+
+# Define the directory to save the PDF files
+rds_path_vst <- "/vast/projects/aml_multiome/Sn_vs_SC/rds_path_vst/"
+fig_path_stnx <- "/home/users/allstaff/ghamsari.r/seurat_figures/Sn_vs_SC_V4/"
+
+```
+
+
+
+# Loading Packages
+```{r, pkgs}
+script_title <- "06_03_Final_EdgeR_pseudo_bulk_Analysis"
+
+pkgs <- c("Signac", "Seurat", "BiocParallel", "DESeq2", "gridExtra", "parallel", "edgeR", "RColorBrewer", "patchwork", 
+"limma", "tibble", "openxlsx", "ggplot2", "reshape2", "dplyr", "grid", "tidyverse", "htmlwidgets", "cowplot", "stringr", 
+"tidyr", "pheatmap", "ggrepel")
+
+
+# Load all packages silently
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# Save session information for reproducibility
+sink(file.path(fig_path_stnx, paste0(script_title, "_sessionInfo.txt")))
+sessionInfo()
+sink()
+```
+
+
+
+
+# Reading data
+```{r, reading objects}
+merged_obj <- readRDS(paste0(rds_path_vst, "05_Merge_object_cell_types_annotated_clustered_list_22_samples_11sn_11sc.rds"))
+all_genes_name <- rownames(merged_obj@assays$RNA)
+removing_genes_patterns <- "^IGHV|^IGKV|^IGLV|^TRAV|^TRBV|^TRDV|^TRGV|^HB[^(P)]|MALAT1|^RP[SL]|^IG[HKL][A-Z0-9-]*|^MT-"
+removing_genes <- grep(removing_genes_patterns, all_genes_name, value = TRUE)
+length(removing_genes) #128
+residual_genes <- all_genes_name[!all_genes_name %in% removing_genes]
+length(residual_genes) #36473
+merged_obj <- subset(merged_obj, features = residual_genes) #34920 features across 172055 samples within 1 assay
+```
+
+
+#EdgR DEGs analysis
+## final cell type level DEGs analysis
+
+Given the design — 11 paired samples (donors), 4 labs (sites), 2 platforms (scRNA/snRNA) — and the goal to:
+```{r}
+DEG_EdgeR_fun <- function(
+  group_name,           # Name of the cell type to analyze
+  sobject,              # Seurat object
+  grouping_column,      # Column name in metadata for cell grouping
+  min_cell_in_group=50 # Minimum number of cells required per group
+ ) {
+
+  # Print progress
+    message(sprintf("Starting analysis for cluster: %s", group_name))
+  
+  # Create a logical vector for the cells in the specified cluster
+  cells_in_group <- sobject@meta.data[[grouping_column]] == group_name
+  
+  # Subset the Seurat object based on the logical vector
+  pre_PB <- subset(
+    x = sobject,
+    cells = Cells(sobject)[cells_in_group]
+  )
+
+  # Define grouping level and create new metadata columns
+  pre_PB@meta.data$Platform_donor <- paste0(pre_PB@meta.data$Platform, "_", pre_PB@meta.data$sample_id)
+  pre_PB@meta.data$Platform_donor_group <- paste0(pre_PB@meta.data$Platform_donor, "__", pre_PB@meta.data[[grouping_column]])
+
+  # Step 1: Calculate cell counts per group
+  group_cell_num <- table(pre_PB@meta.data[["Platform_donor_group"]])
+  cell_counts_df <- as.data.frame(group_cell_num)
+  colnames(cell_counts_df) <- c("Platform_donor_group", "group_cell_counts")
+  merged_metadata <- dplyr::left_join(pre_PB@meta.data, cell_counts_df, by = "Platform_donor_group")
+  pre_PB@meta.data$group_cell_count <- merged_metadata$group_cell_counts
+ table(unique(pre_PB@meta.data$group_cell_count) >min_cell_in_group)
+
+ check_result <- unique(pre_PB@meta.data$group_cell_count) > min_cell_in_group
+
+ # Check if all groups have insufficient cells
+  if (all(!check_result)) {
+    message(paste0("Skipping cluster ", group_name, ": low number of cells in all groups"))
+    return(NULL)  # Return NULL to skip this cluster in the analysis
+  }
+
+
+  
+  # Step 2: Filter for groups with >=50 cells
+  pre_PB <- subset(pre_PB, subset = group_cell_count >= min_cell_in_group)
+
+   message(paste0("Number of cells after filtering based on minimum cell count: ", length(colnames(pre_PB))))
+  
+  # Check if there are enough groups for comparison
+  if (length(unique(pre_PB@meta.data[["Platform_donor_group"]])) < 3) {
+    message(paste0("Skipping cluster ", group_name, ": fewer than 3 groups after filtering"))
+    return(NULL)
+  }
+
+
+ # Check if we have enough donors per platform for a meaningful comparison
+ donor_counts <- aggregate(pre_PB$Platform_donor, 
+                           by = list(pre_PB$Platform), 
+                           FUN = function(x) length(unique(x)))
+ colnames(donor_counts) <- c("Platform", "unique_donors")
+
+ # Identify conditions with at least two unique donors
+ valid_conditions <- donor_counts$Platform[donor_counts$unique_donors >= 2]
+
+ if (length(valid_conditions) < 2) {
+    message(paste0("Skipping cluster ", group_name, ": fewer than 2 conditions with multiple donors"))
+    return(NULL)
+  }
+
+##########################################
+##########################################  # ======= EdgeR Analysis =======
+##########################################
+ # Aggregate expression data for RNA
+ DefaultAssay(pre_PB) <- "RNA"
+ y <- Seurat2PB(pre_PB, sample="sample_id", cluster="Platform")
+ # List of columns to copy
+ columns_to_copy <- c( "sample_id", "Platform", "Site", "Donor")
+
+ # Loop through each column name and copy metadata
+ for (column_name in columns_to_copy) {
+  # Initialize the new column with NA
+  y$samples[[column_name]] <- NA
+  
+  # Match donors and copy data
+  y$samples[[column_name]] <- pre_PB@meta.data[[column_name]][match(y$samples$sample, pre_PB@meta.data$sample_id)]
+  }
+ message(sprintf("EdgeR object dimensions: %d genes x %d samples", nrow(y), ncol(y)))
+
+ # Filter out samples with low library size
+  keep.samples <- y$samples$lib.size > 1e4
+  if (sum(keep.samples) < 3) {
+    message(paste0("Skipping cluster ", group_name, ": fewer than 3 samples after library size filtering"))
+    return(NULL)
+  }
+  y <- y[, keep.samples]
+  
+ 
+ y <- y[rowSums(y$counts >10) >= 4 &rowSums(y$counts) >50, ]
+ if (nrow(y) < 100) {
+    message(paste0("Skipping cluster ", group_name, ": fewer than 100 genes after filtering"))
+    return(NULL)
+  }
+
+ y <- edgeR::normLibSizes(y, method = "TMM")
+
+ # summary(y$samples$norm.factors)
+ 
+
+  # Create sample info data frame for visualization
+  sample_info <- data.frame(
+    sample_id = y$samples$sample_id,
+    libsize = y$samples$lib.size,
+    Platform = y$samples$Platform,
+    Donor = y$samples$Donor,
+    Site = y$samples$Site
+  )
+  
+  # Add all copied columns to sample_info
+  for (column_name in columns_to_copy) {
+    sample_info[[column_name]] <- as.factor(y$samples[[column_name]])
+  }
+  
+
+ mds_plot <- Glimma::glimmaMDS(
+    y,
+    groups = sample_info
+ )
+
+
+ # Save the plot as HTML
+ htmlwidgets::saveWidget(mds_plot, paste0(fig_path_stnx, "MDS_EdgeR/06_03_Final_EdgeR_MDS_", group_name, ".html"))
+
+
+######################################################################################
+################################################# ======= Statistical Modeling =======
+######################################################################################
+ Donor <- factor(y$samples$Donor)
+ Platform <- factor(y$samples$Platform)
+ Site <- factor(y$samples$Site)
+ Sample_id <- factor(y$samples$sample_id)
+ Donor_site <- factor(paste0(Donor,"-" , Site )) #a solution to resolve the rank deficiency issue!
+ # It absorbs all variation due to donor and site (and any confounding between them)
+
+ design <- model.matrix(~Platform  +Donor_site)
+
+ # Clean up column names
+ colnames(design) <- gsub("Platform|Donor|Donor_site", "", colnames(design))
+ colnames(design) <- make.names(colnames(design))
+ colnames(design)[1] <- "Int"
+
+ # Create contrast matrix for platform comparison
+ contrast.matrix <- makeContrasts(
+  snRNA_vs_scRNA = "snRNA",  
+  levels = design
+ ) 
+
+ # Estimate dispersion
+ bulk_RNA <- edgeR::estimateDisp(y, design, robust=TRUE)
+
+
+ # edgeR::plotBCV(bulk_RNA)
+ # Fit the model
+    fit <- edgeR::glmQLFit(bulk_RNA, design, robust=TRUE)
+    
+    # Test for differential expression
+    qlf <- edgeR::glmQLFTest(fit, coef = "snRNA")
+
+ # logFC = log2(mean_expression_in_snRNA / mean_expression_in_scRNA) so when Gene is upregulated in snRNA compared to scRNA >>> LFC is Positive
+
+ # Get results table
+    result <- edgeR::topTags(qlf, n = Inf)$table
+    
+    
+      # Create results structure
+    results <- list(
+      DEG_table = result,
+      design = design,
+      dispersion = bulk_RNA$common.dispersion,
+      BCV = sqrt(bulk_RNA$common.dispersion),
+      sample_info = sample_info
+    )
+    
+ results_list[[group_name]] <- results}
+
+######==================================== Run differential expression analysis for all cell types
+grouping_column <- "cell_type_fine"
+results_list <- list()
+for(group_name in unique(merged_obj$cell_type_fine)){
+ results_list[[group_name]] <- DEG_EdgeR_fun(group_name, sobject=merged_obj, grouping_column= "cell_type_fine", min_cell_in_group = 50 )
+}
+
+saveRDS(results_list, paste0(rds_path_vst, "06_03_Final_EdgeR_RNA_results_cell_type_fine.rds"))
+results_list <- readRDS(paste0(rds_path_vst, "06_03_Final_EdgeR_RNA_results_cell_type_fine.rds"))
+```
+
+# Results Processing and Export
+Process EdgeR results, add significance annotations, and export to Excel format
+```{r}
+results_list <- readRDS(paste0(rds_path_vst, "06_03_Final_EdgeR_RNA_results_cell_type_fine.rds"))
+DEG_final_list <- list()
+# Process results for each cell type
+for (group in names(results_list)) {
+  tbl <- results_list[[group]]$DEG_table
+  tbl <- as.data.frame(tbl)
+  # Add gene names before dplyr operations
+  tbl$Gene_name <- rownames(tbl)  
+  #Add significance and direction annotations
+  final_table <- tbl %>%
+    dplyr::mutate(
+      is_Sig = FDR < 0.05,
+      is_up_snRNA = logFC > 0,
+      is_up_up_scRNA = logFC < 0
+    ) %>%
+    dplyr::arrange(FDR) 
+
+  DEG_final_list[[group]] <- final_table
+}
+
+# Save processed results
+saveRDS(DEG_final_list, paste0(rds_path_vst, "06_03_Final_EdgeR_DEG_celltype_fine.rds"))
+
+
+
+# # Export results to Excel workbook
+wb <- createWorkbook()
+
+# Loop through the data and add worksheets
+for (sheet_name in names(DEG_final_list)) {
+  sheet_tbl <- DEG_final_list[[sheet_name]]
+  sheet_name <- substr(sheet_name, 1, 31)  # Truncate sheet name if it exceeds 31 characters
+
+  # Add a worksheet
+  addWorksheet(wb, sheet_name)
+
+  # Write data as a table with the filter option enabled
+  writeDataTable(wb, sheet = sheet_name, x = sheet_tbl, tableStyle = "TableStyleLight1")
+}
+saveWorkbook(wb, file = paste0(fig_path_stnx, "06_03_Final_EdgeR_DEG_per_celltype_fine.xlsx"), overwrite = TRUE)
+```
+
+## Volcano Plot Visualization
+Generate volcano plots for each cell type showing differential expression patterns
+```{r}
+# Load processed DEG results
+DEG_final_list <- readRDS(paste0(rds_path_vst, "06_03_Final_EdgeR_DEG_celltype_fine.rds"))
+create_volcano_plots <- function(results_tbls, 
+                                 padj = "FDR", 
+                                 log2FoldChange = "logFC", 
+                                 title_txt = "celltype_fine", 
+                                 gene_to_highlight = NULL,
+                                 lfc_cutoff = 1, 
+                                 fdr_cutoff = 0.05,
+                                 top_gene_number= 50) {
+
+  
+  volcano_list <- list()
+  
+  for (group in names(results_tbls)) {
+    res_tbl <- results_tbls[[group]]
+    # Add gene names for labeling
+    res_tbl$gene_name <- rownames(res_tbl)
+    # Define significance based on cutoffs
+    res_tbl$significant <- res_tbl[[padj]] < fdr_cutoff & abs(res_tbl[[log2FoldChange]]) > lfc_cutoff
+     # Determine which genes to highlight
+    res_tbl$gene_to_highlight <- if (!is.null(gene_to_highlight)) {
+      res_tbl$gene_name %in% gene_to_highlight
+    } else {
+       res_tbl$gene_name %in%  head(res_tbl$Gene_name , top_gene_number)
+    }
+     # Create labels for significant and highlighted genes
+    res_tbl$label <- ifelse(res_tbl$gene_to_highlight & res_tbl$significant,
+                            res_tbl$gene_name, NA)
+     # Filter out genes with missing values
+    res_tbl <- res_tbl %>%
+      filter(!is.na(.data[[log2FoldChange]]) & !is.na(.data[[padj]]))
+    
+    res_tbl[[log2FoldChange]] <- as.numeric(res_tbl[[log2FoldChange]])
+    res_tbl[[padj]] <- as.numeric(res_tbl[[padj]])
+    
+    # Create volcano plot
+    p <- ggplot(res_tbl, aes(x = .data[[log2FoldChange]],
+                             y = -log10(pmax(.data[[padj]], 1e-300)),
+                             color = significant)) +
+      
+      # Threshold lines 
+      geom_vline(xintercept = c(-lfc_cutoff, lfc_cutoff), linetype = "dashed", size = 0.3, color = "gray30") +
+      geom_hline(yintercept = -log10(fdr_cutoff), linetype = "dashed", size = 0.3, color = "gray30") +
+      
+      # Points
+      geom_point(alpha = 0.6, size = 0.6) +
+      # Labels
+      geom_text_repel(
+        aes(label = label),size = 2.5, max.overlaps = Inf, box.padding = 0.3, show.legend = FALSE,
+  color = "gray40",            # <-- Label text color
+  segment.color = "gray40",   # <-- Line connecting point to label
+  segment.size = 0.3,
+  segment.alpha = 0.8
+) +
+      
+      scale_color_manual(values = c("FALSE" = "#CC6677", "TRUE" = "#6699CC"),
+                         labels = c("abs(lfc)<1|FDR>0.05", "abs(lfc)>1&FDR<0.05"),
+                         name = "Significance",
+                          guide = guide_legend(override.aes = list(size = 3))) +
+      labs(title = paste0("Top 30 DEGs labled ", title_txt, ": ", group),
+           x = "Log2 Fold Change",
+           y = "-log10(FDR)") +
+      
+      theme_minimal() +
+      theme(
+        axis.text = element_text(size = 10),
+        axis.title = element_text(size = 12, face = "bold"),
+        plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+        legend.position = "right",
+        panel.grid = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA, size = 1)
+      )
+    
+    volcano_list[[group]] <- p
+  }
+  
+  return(volcano_list)
+}
+
+Volcano_plots_DEGs_cell_type <- create_volcano_plots(
+  results_tbls = DEG_final_list,
+  padj = "FDR",
+  log2FoldChange = "logFC",
+  title_txt = "in cell type",
+  gene_to_highlight = NULL,  # Optional
+  lfc_cutoff = 1,
+  fdr_cutoff = 0.05,
+  top_gene_number =30
+)
+
+
+# Save all plots combined into a single PDF page
+pdf(paste0(fig_path_stnx, "06_03_Final_volcano_plots_EdgeR_results_final_cell_type_DEGs_per_cell_type_labeled_all_de_genes_v4.pdf"), width = 22, height = 22)
+plot_grid(plotlist = Volcano_plots_DEGs_cell_type, ncol = 3)
+dev.off()
+message("Volcano plots saved successfully")
+
+```
+# Statistical Summary Visualizations
+## Generate bar plots summarizing differential expression statistics across cell types
+```{r}
+plot_data <- data.frame()
+# cell_typ <- "CD4_T_cells"
+for (cell_typ in names(DEG_final_list)) {
+  tbl <- DEG_final_list[[cell_typ]]
+
+  # Filter upregulated DEGs for snRNA and scRNA
+  up_sn <- tbl %>% filter(FDR < 0.05 & logFC > 0)
+  up_sc <- tbl %>% filter(FDR < 0.05 & logFC < 0)
+  none_DE <- tbl %>% filter(FDR > 0.05 | logFC == 0)
+
+# Quality check: ensure all genes are accounted for
+if (
+ nrow(up_sn) + nrow(up_sc) + nrow(none_DE) == nrow(tbl)){
+  # Calculate summary stats
+  tmp <- data.frame(
+    cell_type = cell_typ,
+    group = c("snRNA", "scRNA", "none_DE"),
+    count = c(nrow(up_sn), nrow(up_sc),  nrow(none_DE)),
+    median_logFC = c(ifelse(nrow(up_sn) > 0, median(up_sn$logFC), NA),
+                   ifelse(nrow(up_sc) > 0, abs(median(up_sc$logFC)), NA),
+                   ifelse(nrow(none_DE) > 0, abs(median(none_DE$logFC)), NA)),
+   median_FDR = c(ifelse(nrow(up_sn) > 0, median(up_sn$FDR), NA),
+                 ifelse(nrow(up_sc) > 0, median(up_sc$FDR), NA), 
+                 ifelse(nrow(none_DE) > 0, median(none_DE$FDR), NA)),
+    mean_logFC = c(ifelse(nrow(up_sn) > 0, mean(up_sn$logFC), NA),
+                   ifelse(nrow(up_sc) > 0, abs(mean(up_sc$logFC)), NA),
+                   ifelse(nrow(none_DE) > 0, abs(mean(none_DE$logFC)), NA)),
+    mean_FDR = c(ifelse(nrow(up_sn) > 0, mean(up_sn$FDR), NA),
+                 ifelse(nrow(up_sc) > 0, mean(up_sc$FDR), NA),
+                 ifelse(nrow(none_DE) > 0, mean(none_DE$FDR), NA))
+  )
+
+  plot_data <- rbind(plot_data, tmp)
+}
+}
+# Set factor levels for consistent ordering
+plot_data$cell_type <- factor(plot_data$cell_type, levels = names(DEG_final_list))
+
+
+# Function to create grouped bar plots
+plot_group_bar <- function(data, y_var, y_label, fill_colors, title) {
+  ggplot(data, aes_string(x = "cell_type", y = y_var, fill = "group")) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
+    scale_fill_manual(values = fill_colors) +
+    scale_y_continuous(expand = c(0, 0)) +
+    labs(
+      title = title,
+      x = "Cell Type",
+      y = y_label,
+      fill = "Method"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.line = element_line(color = "black", size = 0.2)
+    )
+}
+
+# Define color scheme
+fill_colors <- c("snRNA" = "#CC6677", "scRNA" = "#6699CC", "none_DE" = "gray")
+# Create individual plots
+p_count <- plot_group_bar(plot_data, "count", "Number of Genes", fill_colors,
+                          "Number of Upregulated DEGs")
+
+p_logFC_Mean <- plot_group_bar(plot_data, "mean_logFC", "Mean logFC", fill_colors,
+                          "Mean LFC in Upregulated DEGs")
+
+p_FDR_Mean <- plot_group_bar(plot_data, "mean_FDR", "Mean FDR", fill_colors,
+                        "Mean FDR in Upregulated DEGs")
+
+p_logFC_Median <- plot_group_bar(plot_data, "median_logFC", "Median logFC", fill_colors,
+                          "Median LFC in Upregulated DEGs")
+
+p_FDR__Median <- plot_group_bar(plot_data, "median_FDR", "Median FDR", fill_colors,
+                        "Median FDR in Upregulated DEGs")
+
+
+combined_plot <- p_count + p_logFC_Mean + p_FDR_Mean + p_logFC_Median + p_FDR__Median + plot_layout(ncol = 3)
+
+# Show combined plot
+print(combined_plot)
+
+# Save combined plot as PDF
+pdf_file <- paste0(fig_path_stnx, "06_03_Final_group_barplots_DEG_stats_v2.pdf")
+ggsave(pdf_file, combined_plot, width = 24, height = 8)
+message("Summary bar plots saved successfully")
+
+```
+# Jaccard Similarity Heatmap
+Generate heatmap showing similarity between upregulated gene sets across cell types and platforms
+
+```{r, fig.width=10}
+# Load processed DEG results
+DEG_final_list <- readRDS(paste0(rds_path_vst, "06_03_Final_EdgeR_DEG_celltype_fine.rds"))
+names(DEG_final_list)
+# Set up PDF output
+pdf_file <- paste0(fig_path_stnx, "06_03_Final_Jaccard_heatmap_DEGs_top200_up_lf_0_both.pdf")
+pdf(pdf_file, width = 7, height = 5)
+
+# Prepare a dataframe for plotting
+DEG_list_celltype_method <- list()
+
+for (cell_typ in names(DEG_final_list)) {
+  tbl <- DEG_final_list[[cell_typ]]
+  tbl <- tbl[order(tbl$FDR), ]
+  # Genes up in snRNA (FDR < 0.05 & logFC > 0)
+  genes_up_sn <- tbl$gene[tbl$FDR < 0.05 & tbl$logFC > 0][1:200]
+    # Sort by adjusted p-value
+    
+  
+  # # Genes up in scRNA (FDR < 0.05 & logFC < 0)
+  genes_up_sc <- tbl$gene[tbl$FDR < 0.05 & tbl$logFC < 0][1:200]
+  
+  # Store in list with descriptive names
+  DEG_list_celltype_method[[paste0(cell_typ, "__snRNA")]] <- genes_up_sn
+  DEG_list_celltype_method[[paste0(cell_typ, "__scRNA")]] <- genes_up_sc
+}
+
+length(DEG_list_celltype_method)
+
+get_jaccard_matrix <- function(up_gene_list) {
+  n <- length(up_gene_list)
+  mat <- matrix(NA, n, n, dimnames = list(names(up_gene_list), names(up_gene_list)))
+ for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
+      mat[i, j] <- length(intersect(up_gene_list[[i]], up_gene_list[[j]])) / 
+                   length(union(up_gene_list[[i]], up_gene_list[[j]]))
+    }
+ }
+
+  return(mat)
+}
+
+
+mtx_jaccards <- get_jaccard_matrix(DEG_list_celltype_method)
+
+# Convert upper triangle to full symmetric matrix
+mtx_jaccards[lower.tri(mtx_jaccards)] <- t(mtx_jaccards)[lower.tri(mtx_jaccards)]
+
+color_mapping <- setNames(levels(merged_obj$colors_cell_type_fine), levels(merged_obj$cell_type_fine))
+my_annotation_colors <- list(
+  Platform = c(scRNA = "#6699CC", snRNA = "#CC6677"),
+  Cell_Type = color_mapping
+)
+
+# Create a metadata data.frame
+meta <- data.frame(Sample = rownames(mtx_jaccards)) %>%
+  separate(Sample, into = c("Cell_Type", "Platform"), sep = "__",  remove = FALSE)
+
+
+# Use as annotation row/column with reordered columns
+annotation_col <- meta %>%
+  select(Sample, Cell_Type, Platform) %>%  # re-order columns
+  column_to_rownames("Sample")
+
+annotation_row <- meta %>%
+  select(Sample, Cell_Type) %>%  # re-order columns
+  column_to_rownames("Sample")
+
+dist_jaccard <- as.dist(1 - mtx_jaccards)
+
+
+# Embed into Euclidean space using multidimensional scaling
+mds_coords <- cmdscale(dist_jaccard, k = 29) #
+
+
+# Compute Euclidean distances on embedded data
+dist_euc <- dist(mds_coords)
+
+# Ward.D2 clustering on Euclidean distances
+hc_ward <- hclust(dist_euc, method = "ward.D2")
+# Define color schemes
+color_sc <- c("white", "#00468B")
+color_sn <- c("white", "#8B0046")
+color_both <- c("white", "#737373")
+fontsize = 5
+
+# Create heatmap
+pheatmap(mtx_jaccards,
+         cluster_rows = hc_ward,
+         cluster_cols = hc_ward,
+         clustering_distance_rows = NULL,
+         clustering_distance_cols = NULL,
+         clustering_method = NULL,
+         annotation_col = annotation_col,
+         annotation_row = annotation_row,
+         annotation_colors = my_annotation_colors,
+         fontsize_row = fontsize,
+         fontsize_col = fontsize,
+         main = "Ward.D2 clustering on MDS-embedded Jaccard distances top200 DEGs for each cell type",
+         color = colorRampPalette(color_both)(300),
+         treeheight_col = 30,
+         treeheight_row = 0)
+
+
+dev.off()
+
+
+message("Jaccard similarity heatmap saved successfully")
+```
+# Gene Length Bias Analysis
+Analyze the relationship between gene length and differential expression patterns
+
+```{r}
+# Load DEG list
+DEG_final_list <- readRDS(paste0(rds_path_vst, "06_03_Final_EdgeR_DEG_celltype_fine.rds"))
+
+# Collect upregulated genes for both platforms
+genes_up_sn_list <- c()
+genes_up_sc_list <- c()
+for (cell_typ in names(DEG_final_list)) {
+  tbl <- DEG_final_list[[cell_typ]]
+  
+  # Extract genes upregulated in snRNA
+  genes_up_sn <- tbl[tbl$FDR < 0.05 & tbl$logFC > 0, "hgnc_symbol_original"]
+  # Extract genes upregulated in scRNA
+  genes_up_sc <- tbl[tbl$FDR < 0.05 & tbl$logFC < 0, "hgnc_symbol_original"]
+  
+  # Combine with previous lists (union to avoid duplicates)
+  genes_up_sn_list <- union(genes_up_sn_list, genes_up_sn)
+  genes_up_sc_list <- union(genes_up_sc_list, genes_up_sc)
+}
+message(sprintf("Found %d genes upregulated in snRNA", length(genes_up_sn_list)))
+message(sprintf("Found %d genes upregulated in scRNA", length(genes_up_sc_list)))
+
+# length(genes_up_sn_list) #9719
+# length(genes_up_sc_list) #9508
+# Gene annotation table
+gene_df <- merged_obj@assays$RNA@meta.data %>%
+  filter(!is.na(gene_length))
+
+# Bin genes by length (50 quantile bins)
+gene_df <- gene_df %>%
+  mutate(length_bin = cut(
+    gene_length,
+    breaks = quantile(gene_length, probs = seq(0, 1, length.out = 50), na.rm = TRUE),
+    include.lowest = TRUE
+  ))
+
+# Annotate genes
+gene_df <- gene_df %>%
+  mutate(
+    up_sn = hgnc_symbol_original %in% genes_up_sn_list,
+    up_sc = hgnc_symbol_original %in% genes_up_sc_list
+  )
+
+sum(gene_df$up_sn, na.rm = TRUE) #9578
+sum(gene_df$up_sc, na.rm = TRUE) #9423
+# Count upregulated genes per length bin
+counts_by_bin <- gene_df %>%
+  group_by(length_bin) %>%
+  summarise(
+    total_up_sn = sum(up_sn, na.rm = TRUE),
+    total_up_sc = sum(up_sc, na.rm = TRUE),
+    total_genes = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    bin_start = as.numeric(str_extract(length_bin, "(?<=\\[|\\()[0-9\\.eE\\+\\-]+")),
+    bin_end = as.numeric(str_extract(length_bin, "(?<=,)[0-9\\.eE\\+\\-]+(?=\\]|\\))")),
+    bin_mid = (bin_start + bin_end) / 2,
+    bin_mid = as_factor(bin_mid)
+  )
+
+# Reshape for plotting
+plot_df <- counts_by_bin %>%
+  pivot_longer(cols = c(total_up_sn, total_up_sc), names_to = "platform", values_to = "count") %>%
+  mutate(platform = recode(platform, total_up_sn = "snRNA", total_up_sc = "scRNA"))
+# Create and save plot
+pdf(file = paste0(fig_path_stnx, "06_03_Final_Distribution_gene_length_DEGs_v2.pdf"), width = 8, height = 5)
+
+# Plot
+ggplot(plot_df, aes(x = bin_mid, y = count, color = platform, group = platform)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  labs(
+    title = "Number of Upregulated Genes per Gene Length Bin",
+    x = "Gene Length Bin Midpoint (bp)",
+    y = "Number of Upregulated Genes",
+    color = "Platform"
+  ) +
+  scale_x_discrete(breaks = levels(plot_df$bin_mid)[seq(1, length(levels(plot_df$bin_mid)), by = 2)]) +scale_y_continuous(breaks = scales::pretty_breaks(n = 10))+
+
+  scale_color_manual(values = c("scRNA" = "#00468B", "snRNA" = "#8B0046")) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.line = element_line(color = "black")
+  )
+
+dev.off()
+
+message("Gene length distribution analysis completed and saved")
+```
+
+
+

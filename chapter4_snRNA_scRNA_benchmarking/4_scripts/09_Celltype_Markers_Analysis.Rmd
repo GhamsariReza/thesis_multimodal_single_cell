@@ -1,0 +1,276 @@
+---
+title: "09_Celltype_Markers_Analysis"
+author: "Reza Ghamsari"
+date: "2025-06-10"
+output: html_document
+---
+# Script Overview
+This script performs comprehensive cell type marker analysis comparing single nuclei  vs single cell sequencing data.
+It identifies marker genes for each cell type across samples, calculates Jaccard similarity indices to assess marker gene reproducibility,
+and generates hierarchical clustering visualizations to evaluate method consistency.
+
+```{r setup, include=FALSE}
+all_times <- list()  # store the time for each chunk
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now)
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  time_it = TRUE
+)
+```
+
+# Define Color Schemes and File Paths
+```{r, colors}
+# Custom color palette for consistent visualization
+my_colors <- unique(c(
+  "#802268FF", "#006400", "#525ecc99", "#1f0fdf99", "#480607", "#D55E00", 
+  "#164194FF", "#7E6148FF", "#ADB6B6FF", "#52a7cc99", "#F0E685FF", "#cc52c099", 
+  "#6acc5299", "#DC143C", "#802268FF", "#ffbb78", "#3C548899", "#189b3699", 
+  "#cc9b5299", "#1f0fdf99", "#ccebc5", "#42857599", "#868686FF", "#006400", 
+  "#0A47FFFF", "#3B1B53FF", "#749B58FF", "#ccc05299", "#cc765299", "#1B1919FF", 
+  "#00D68FFF", "#14FFB1FF", "#3C5488FF", "#8F7700FF", "#164194FF", "#0094CDFF", 
+  "#FFDAB9", "#FF00FF", "#00FFFF", "green", "blue", "#480607"
+))
+
+# Define the directory to save the PDF files
+rds_path_vst <- "/vast/projects/aml_multiome/Sn_vs_SC/rds_path_vst/"
+fig_path_stnx <- "/home/users/allstaff/ghamsari.r/seurat_figures/Sn_vs_SC_V4/"
+
+```
+
+
+
+# Loading Packages
+```{r, pkgs}
+script_title <- "09_Celltype_Markers_Analysis"
+pkgs <- c("Signac", "Seurat", "BiocParallel", "DESeq2", "gridExtra", "parallel", "edgeR", "RColorBrewer", "patchwork", 
+"limma", "tibble", "openxlsx", "ggplot2", "reshape2", "dplyr", "grid", "tidyverse", "htmlwidgets", "cowplot", "stringr", 
+"tidyr", "pheatmap", "ggrepel", "future", "future.apply")
+
+
+# Load all packages silently
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# Save session information for reproducibility
+sink(file.path(fig_path_stnx, paste0(script_title, "_sessionInfo.txt")))
+sessionInfo()
+sink()
+```
+
+# Reading data
+```{r, reading objects}
+merged_obj <- readRDS(paste0(rds_path_vst, "05_Merge_object_cell_types_annotated_clustered_list_22_samples_11sn_11sc.rds"))
+
+table(merged_obj$cell_type_broad,merged_obj$cell_type_fine,useNA = "ifany" )
+table(merged_obj$cell_type_broad,merged_obj$sample_id,useNA = "ifany" )
+
+```
+# Marker Gene Identification
+```{r, clustering}
+# Idents(merged_obj) <- merged_obj$cell_type_broad
+Idents(merged_obj) <- merged_obj$cell_type_fine
+# Split object by sample for individual marker identification
+merged_obj_list<- SplitObject(merged_obj, split.by = "sample_id")
+
+
+# the number of available cores
+num_cores <- parallelly::availableCores() #56
+# Use multisession for stability (spawns separate R sessions instead of forking)
+plan(multisession, workers = num_cores - 4)
+
+FindAllMarkers_list <- function(x) {
+  x <- NormalizeData(x, assay = "RNA")
+  markers <- FindAllMarkers(x, 
+                            only.pos = TRUE, 
+                            min.cells.group = 3)
+  return(markers)
+}
+
+all_markers_list <- future_lapply(merged_obj_list, 
+                                  FindAllMarkers_list, 
+                                  future.seed = TRUE)
+# saveRDS(all_markers_list, paste0(rds_path_vst, "09_Find_all_markers_list_broad_cell_type.rds"))
+saveRDS(all_markers_list, paste0(rds_path_vst, "09_Find_all_markers_list_cell_type_fine.rds"))
+```
+
+# Jaccard Similarity Analysis
+Marker Gene Filtering and List Preparation
+
+```{r, fig.width=20, fig.height=20}
+# Extract top marker genes for each cell type in each sample
+all_markers_list <- readRDS(paste0(rds_path_vst, "09_Find_all_markers_list_cell_type_fine.rds"))
+# Initialize an empty list
+filtered_gene_list <- list()
+
+# Loop over each sample
+for (sample_name in names(all_markers_list)) {
+  marker_df <- all_markers_list[[sample_name]]
+  
+  # Optional: filter genes based on thresholds
+  marker_df <- subset(marker_df, p_val_adj < 0.05 & avg_log2FC > 1)
+  
+  # Loop over each cluster (cell type)
+  for (ct in unique(marker_df$cluster)) {
+    df_ct <- marker_df[marker_df$cluster == ct, ]
+    
+    # Sort by adjusted p-value
+    df_ct <- df_ct[order(df_ct$p_val_adj), ]
+    
+    genes <- df_ct$gene[1:200]
+    print(paste0(sample_name, ";", ct , ": " , length(genes)))
+    
+    list_name <- paste0(sample_name, "__", ct)
+    filtered_gene_list[[list_name]] <- unique(genes)
+  }
+}
+
+#============================= Jaccard Index Calculation and Visualization
+get_jaccard_matrix <- function(filtered_gene_list) {
+  n <- length(filtered_gene_list)
+  mat <- matrix(NA, n, n, dimnames = list(names(filtered_gene_list), names(filtered_gene_list)))
+ for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
+      mat[i, j] <- length(intersect(filtered_gene_list[[i]], filtered_gene_list[[j]])) / 
+                   length(union(filtered_gene_list[[i]], filtered_gene_list[[j]]))
+    }
+ }
+
+  return(mat)
+}
+
+# Calculate Jaccard similarity matrix
+mtx_jaccards <- get_jaccard_matrix(filtered_gene_list)
+dim(mtx_jaccards) #330
+
+# Convert upper triangle to full symmetric matrix
+mtx_jaccards[lower.tri(mtx_jaccards)] <- t(mtx_jaccards)[lower.tri(mtx_jaccards)]
+
+
+my_annotation_colors <- list(
+  Method = c(cell = "#6699CC", Nuclei = "#CC6677"),
+  Site = c(S1 = "#661100", S2 = "#888888", S3 = "#008B45", S4 = "#D55E00", ALL= "white" ),
+  Donor = c(D1 = "#00A087FF", D2 = "#4A0F5FFF", D3 = "#00468B", D4 = "#BB0021FF",
+            D5 = "#006400", D6 = "#08306B", D7 = "#ffbb78", D8 = "#8da0cb",
+            D9 = "#e78ac3"),
+  # cell_type = c("HSC" = "#ADB6B6FF",
+  #                     "Erythroblast" = "#A20056FF",
+  #                      "Reticulocyte" = "#BB0021FF",
+  #                       "Normoblast" = "#9d183299",
+  #                   "Monocytes" = "#D55E00",
+  #                     "G.M_prog" = "#ffbb78",
+  #                        "Lymph_Prog" = "#802268FF",
+  #                   "pDC" = "#4A0F5FFF",
+  #                     "B_Cells" = "#00468B",
+  #                            "Plasmablast" = "#6699CC",
+  #                     "NK_Cells" = "#008B45",
+  #                     "T_cells" = "#00A087FF")
+  cell_type =  c("HSC" = "#ADB6B6FF",
+                      "Erythroblast" = "#A20056FF",
+                      "Reticulocyte" = "#BB0021FF",
+                       "Normoblast" = "#9d183299",
+                        "CD16_Monocyte" = "#F05C3BFF",
+                        "CD14_Monocyte" = "#D55E00",
+                       "G.M_prog" = "#ffbb78",
+                      "Monocyte_low_qc" = "#F0E685FF",
+                         "Lymph_Prog" = "#802268FF",
+                       "pDC" = "#4A0F5FFF",
+                      "Transitianl_B_Cells" = "#08306B",
+                      "B_Cells" = "#00468B",
+                      "Plasmablast" = "#6699CC",
+                      "NK_Cells" = "#008B45",
+                      "CD4_T_cells" = "#00A087FF",
+                      "CD8_T_cells" = "#91D1C2FF")
+  )
+
+
+
+length(rownames(mtx_jaccards))
+
+# Create a metadata data.frame
+meta <- data.frame(Sample = rownames(mtx_jaccards)) %>%
+  separate(Sample, into = c("sample_id" , "cell_type"), sep = "__",  remove = FALSE) %>%
+  separate(sample_id, into = c("Site", "Donor", "Method"), sep = "_",  remove = FALSE)
+
+
+# Use as annotation row/column with reordered columns
+annotation_col <- meta %>%
+  select(Sample, cell_type, Method) %>%  # re-order columns
+  column_to_rownames("Sample")
+
+annotation_row <- meta %>%
+  select(Sample,cell_type, Method, Site, Donor)%>%  # re-order columns
+  column_to_rownames("Sample")
+
+# matrix is a similarity matrix (Jaccard index between 0 and 1), not a distance matrix.Most clustering functions expect a distance matrix, so need to be converted:
+
+dist_jaccard <- as.dist(1 - mtx_jaccards)
+
+# Embed into Euclidean space
+mds_coords <- cmdscale(dist_jaccard, k = 16) 
+
+# Compute Euclidean distances on embedded data
+dist_euc <- dist(mds_coords)
+
+# Ward.D2 clustering on Euclidean distances
+hc_ward <- hclust(dist_euc, method = "ward.D2")
+# png_file <- paste0(fig_path_stnx, "09_Jaccard_markers_cell_type_fine_lfc_1_top200_large.png")
+png_file <- paste0(fig_path_stnx, "09_Jaccard_markers_cell_type_fine_lfc_1_top200_small.png")
+png(png_file, width = 9*600, height = 5*600, res = 600)
+# png(png_file, width = 20*600, height = 20*600, res = 600)
+# color_vector <- c("white", "#ad5fad")
+color_vector <- c("white", "#737373")
+fontsize = 5
+
+# Use hc_ward in heatmap
+pheatmap(mtx_jaccards,
+         cluster_rows = hc_ward,
+         cluster_cols = hc_ward,
+         clustering_distance_rows = NULL,
+         clustering_distance_cols = NULL,
+         clustering_method = NULL,
+         annotation_col = annotation_col,
+         annotation_row = annotation_row,
+         annotation_colors = my_annotation_colors,
+         fontsize_row = fontsize,
+         fontsize_col = fontsize,
+         main = "Ward.D2 clustering on MDS-embedded Jaccard distances Jaccard Similarity of marker genes for each cell type within each sample across both methods",
+         color = colorRampPalette(color_vector)(300),
+         treeheight_col = 30,
+         treeheight_row = 0)
+
+dev.off()
+# pheatmap(mtx_jaccards,
+#          clustering_distance_rows = dist_jaccard,
+# clustering_distance_cols = dist_jaccard,
+#          # clustering_method = "complete",
+# # Ward requires Euclidean distance because it minimizes within-cluster variance.
+# # Jaccard distance violates this assumption — using Ward on it leads to poor or meaningless clusters.
+#  clustering_method = "average",
+#           cluster_rows = TRUE,
+#          cluster_cols = TRUE,
+#          annotation_col = annotation_col,
+#          annotation_row = annotation_row,
+#         annotation_colors = my_annotation_colors,
+# fontsize_row = fontsize, fontsize_col = fontsize,
+#          main = "Jaccard Similarity of marker genes for each cell type within each sample across both methods",
+# color <- colorRampPalette(color_vector)(300),
+#   # treeheight_row = 200,
+# cutree_rows	= NA,
+# cutree_cols = NA,
+# 
+#          treeheight_col = 100
+# )
+
+
+```
+

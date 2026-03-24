@@ -1,0 +1,259 @@
+---
+title: "01_Creating_Seurat_object_PreProcessing_BMMC_22_samples"
+author: "Reza Ghamsari"
+date: "2024-08-14"
+output: html_document
+---
+
+# Script Overview
+This script preprocesses single-cell and single-nucleus RNA sequencing data from 22 matched samples (11 nuclei and 11 single-cell). 
+It creates Seurat objects, removes ambient RNA contamination using SoupX, and visualizes the results. 
+The script is structured into logical sections for clarity and reproducibility.
+
+
+```{r setup, include=FALSE}
+# Setup: Initialize timing hooks and global chunk options
+all_times <- list()  # Store execution time for each chunk
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now)
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+  message = FALSE,  # Suppress messages
+  warning = FALSE,  # Suppress warnings
+  time_it = TRUE    # Enable timing for chunks
+)
+```
+---
+# Directories and Colors
+```{r colors}
+# Define custom color palette for visualizations
+my_colors <- c(
+  "#9d183299", "#00A087FF", "#525ecc99", "#E9967A", "#4DBBD5FF", "#003C67FF",
+  "#386cb0", "#7E6148FF", "#ADB6B6FF", "#52a7cc99", "#F0E685FF", "#cc52c099",
+  "#6acc5299", "#DC143C", "#802268FF", "#ffbb78", "#3C548899", "#189b3699",
+  "#cc9b5299", "#1f0fdf99", "#ccebc5", "#42857599", "#868686FF", "#006400",
+  "#0A47FFFF", "#3B1B53FF", "#749B58FF", "#ccc05299", "#cc765299", "#1B1919FF",
+  "#00D68FFF", "#14FFB1FF", "#3C5488FF", "#8F7700FF", "#164194FF", "#0094CDFF",
+  "#FFDAB9", "#FF00FF", "#00FFFF", "green", "blue", "#480607"
+)
+
+# Define paths for saving RDS and figures
+rds_path_vst <- "/vast/projects/aml_multiome/Sn_vs_SC/rds_path_vst/"
+fig_path_stnx <- "/home/users/allstaff/ghamsari.r/seurat_figures/Sn_vs_SC_V4/"
+```
+---
+# Loading Required Packages
+```{r pkgs}
+script_title <- "01_Creating_Seurat_object_PreProcessing_BMMC_22_samples"
+# Load necessary libraries
+pkgs <- c(
+  "Signac", "Seurat", "ggplot2", "SoupX", "scCustomize", "gridExtra",
+  "parallel", "clustree", "RColorBrewer", "patchwork", "igraph",
+  "tibble", "biomaRt", "reshape2", "dplyr", "grid", "unix", "future", "future.apply"
+)
+
+# Load packages
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# Save session information for reproducibility
+sink(file.path(fig_path_stnx, paste0(script_title, "_sessionInfo.txt")))
+sessionInfo()
+sink()
+```
+---
+# Memory Configuration and Limits ----
+ Retrieve system memory details (total and available) and configure safe limits 
+for R, Slurm, and the future package to prevent memory overuse during analysis
+```{r memory}
+# Check available memory and set limits
+system_info <- system("free -b | grep Mem", intern = TRUE)
+mem_info <- strsplit(system_info, " +")[[1]]
+available_ram <- as.numeric(mem_info[4])
+total_memory_bytes <- as.numeric(mem_info[2])
+available_memory_bytes <- as.numeric(mem_info[6])
+
+# Print memory details
+print(paste("Total memory (bytes):", total_memory_bytes))
+print(paste("Available memory (bytes):", available_memory_bytes))
+
+# Set memory limits for the script
+slurm_mem_available_B <- as.numeric(Sys.getenv("SLURM_MEM_PER_NODE", unset = NA)) * 10^6
+Memory_to_use <- slurm_mem_available_B - (2000 * 2^20)  # Reserve 2GB for safety
+unix::rlimit_as(Memory_to_use, Memory_to_use)
+rlimit_core(cur = 55, max = 55)
+
+# Set future package memory limit
+options(future.globals.maxSize = 256000 * 1024^2)  # 25 GiB
+current_size_gib <- getOption("future.globals.maxSize") / 1024^3
+cat("Current future.globals.maxSize is:", current_size_gib, "GiB\n")
+```
+---
+# Creating Seurat Objects
+The public dataset consists of 25 samples; however, since some of them did not match, I only used the matched samples, which include 11 nuclei from the Multiome kit and 11 single-cell samples from the CITE-seq kit.
+```{r,}
+# Define paths and sample IDs
+path_to_BMMC <- "/stornext/General/data/user_managed/grpu_mritchie_1/reza/projects/mat_seq/BMMC_luecken/cellranger_outputs/count_outputs/"
+base_dirs <- rep(path_to_BMMC, 25)
+list_of_BMMC_samples <- list.dirs(path_to_BMMC, recursive = FALSE, full.names = FALSE)
+sample_ids <- list_of_BMMC_samples
+
+# Initialize lists for storing data
+filtered_count_list <- list()
+raw_count_list <- list()
+sobj_list <- list()
+
+# Create Seurat objects for each sample
+for (i in seq_along(sample_ids)) {
+  sample_id <- sample_ids[i]
+  file_path <- paste0(base_dirs[i], sample_id, "/outs/")
+  filter_counts <- Read10X_h5(paste0(file_path, "/filtered_feature_bc_matrix.h5"))
+  raw_counts <- Read10X(paste0(file_path, "/raw_feature_bc_matrix"))
+  seurat_obj <- CreateSeuratObject(counts = filter_counts)
+  seurat_obj$sample_id <- sample_id
+
+  # Store data in lists
+  filtered_count_list[[sample_id]] <- filter_counts
+  raw_count_list[[sample_id]] <- raw_counts
+  sobj_list[[sample_id]] <- seurat_obj
+}
+
+# Remove unwanted samples
+sobj_list$S3_D1_cell <- NULL
+sobj_list$S3_D10_Nuclei <- NULL
+sobj_list$S3_D3_Nuclei <- NULL
+```
+---
+
+# Removing Ambient RNA
+## Pre Clustering
+
+```{r clustering}
+# Function to preprocess Seurat objects
+processSeurat <- function(x) {
+  x <- SCTransform(x, vst.flavor = "v2", verbose = FALSE, new.assay.name = "SCT_soupx", seed.use = 1448145)
+  x <- RunPCA(x, reduction.name = 'pca_soupx', assay = "SCT_soupx")
+  x <- FindNeighbors(x, reduction = 'pca_soupx', dims = 1:50, graph.name = 'graph_soupx')
+  x <- FindClusters(x, graph.name = "graph_soupx", resolution = 0.8, verbose = FALSE)
+  x@meta.data$soupx_clusters <- x@meta.data$seurat_clusters
+  x@meta.data$seurat_clusters <- NULL
+  return(x@meta.data)
+}
+
+# Parallel processing for clustering
+library(future)
+plan(multisession, workers = parallelly::availableCores() - 10)
+soupx_metadata_list <- future_lapply(sobj_list, processSeurat)
+
+# Add clustering metadata back to Seurat objects
+for (obj_name in names(sobj_list)) {
+  if (obj_name %in% names(soupx_metadata_list)) {
+    sobj <- sobj_list[[obj_name]]
+    meta <- soupx_metadata_list[[obj_name]]
+    if (identical(rownames(meta), colnames(sobj))) {
+      sobj$soupx_clusters <- meta$soupx_clusters
+      sobj_list[[obj_name]] <- sobj
+    }
+  }
+}
+```
+
+##Running Soupx 
+https://rawcdn.githack.com/constantAmateur/SoupX/204b602418df12e9fdb4b68775a8b486c6504fe4/inst/doc/pbmcTutorial.html
+
+```{r}
+ Run SoupX to correct ambient RNA contamination
+soupx_results <- future_lapply(names(sobj_list), function(Obj_name) {
+  if (Obj_name %in% list_of_BMMC_samples) {
+    sobj <- sobj_list[[Obj_name]]
+    raw <- Read10X(file.path(base_dir, Obj_name, "outs", "raw_feature_bc_matrix"))
+    sc <- SoupChannel(raw, sobj@assays$RNA$counts)
+    sc <- setClusters(sc, sobj@meta.data$soupx_clusters)
+    sc <- autoEstCont(sc, doPlot = FALSE)
+    out <- adjustCounts(sc, roundToInt = TRUE)
+    return(list(name = Obj_name, counts = out))
+  } else {
+    return(NULL)
+  }
+})
+
+# Filter and save corrected counts
+soupx_results <- Filter(Negate(is.null), soupx_results)
+soupx_list <- setNames(
+  lapply(soupx_results, function(x) x$counts),
+  sapply(soupx_results, function(x) x$name)
+)
+
+# Create Seurat objects from corrected counts
+corrected_list <- list()
+for (sobj in names(soupx_list)) {
+  corrected_list[[sobj]] <- CreateSeuratObject(counts = soupx_list[[sobj]])
+}
+```
+
+# Exporting and Visualizing Results
+```{r visualization}
+# Calculate ambient RNA percentages and save results
+results <- data.frame()
+for (obj in names(sobj_list)) {
+  sobj <- sobj_list[[obj]]
+  corrected_obj <- corrected_list[[obj]]
+  rna_counts <- sobj@assays$RNA$counts
+  if (identical(colnames(soupx_list[[obj]]), colnames(rna_counts)) &&
+      identical(rownames(soupx_list[[obj]]), rownames(rna_counts))) {
+    Total_Count_RNA <- sum(rna_counts)
+    Count_Ambient_RNA <- Total_Count_RNA - sum(soupx_list[[obj]])
+    ambient_percentage <- round((1 - (sum(soupx_list[[obj]]) / Total_Count_RNA)) * 100, 1)
+    corrected_obj$Ambient_RNA_Percentage <- ambient_percentage
+    corrected_list[[obj]] <- corrected_obj
+    results <- rbind(results, data.frame(
+      Sample = obj,
+      Total_Count_RNA = Total_Count_RNA,
+      nCount_Ambient_RNA = Count_Ambient_RNA,
+      nCount_corrected = Total_Count_RNA - Count_Ambient_RNA,
+      Percentage_ambient = ambient_percentage,
+      Percentage_correct = 100 - ambient_percentage
+    ))
+  }
+}
+
+# Save results to CSV
+write.csv(results, file = paste0(fig_path_stnx, "01_Ambient_RNA_percentage_2.csv"), row.names = TRUE)
+
+# Generate stacked bar plots
+library(tidyr)
+library(dplyr)
+library(tidyverse)
+
+results_long <- results %>%
+  pivot_longer(cols = c(nCount_corrected, nCount_Ambient_RNA), names_to = "RNA_Type", values_to = "Count")
+
+plot <- ggplot(results_long, aes(x = Sample, y = Count, fill = RNA_Type)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Ambient RNA Count per Sample \n SoupX", x = "Sample", y = "RNA Count") +
+  scale_fill_manual(values = c("nCount_corrected" = "steelblue", "nCount_Ambient_RNA" = "firebrick")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Save plots to PDF
+pdf(file = paste0(fig_path_stnx, "01_Ambeint_RNA_stacked_bar_plot.pdf"), width = 15, height = 10, pointsize = 5)
+print(plot)
+dev.off()
+```
+
+---
+
+# Save Final Corrected Objects
+```{r save_corrected}
+# Save the corrected Seurat objects
+saveRDS(corrected_list, paste0(rds_path_vst, "01_SoupX_corrected_Seurat_object_list_22_samples_11sn_11sc.rds"))
+```
+
+

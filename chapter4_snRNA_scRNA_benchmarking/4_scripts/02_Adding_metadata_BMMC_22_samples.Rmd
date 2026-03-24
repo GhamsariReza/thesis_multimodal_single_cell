@@ -1,0 +1,544 @@
+---
+title: "02_Adding_metadata_BMMC_22_samples"
+author: "Reza Ghamsari"
+date: "2024-08-24"
+output: html_document
+---
+
+#Script Description:
+This script, processes single-cell and single-nucleus RNA-seq data for 22 samples. 
+It includes metadata integration, gene annotation, and visualization. 
+The script is structured into logical sections, with each chunk performing a specific task.
+```{r setup, include=FALSE}
+# Setup: Initialize timing hooks and global chunk options
+all_times <- list()  # Store execution time for each chunk
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now)
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+  message = FALSE,  # Suppress messages
+  warning = FALSE,  # Suppress warnings
+  time_it = TRUE    # Enable timing for chunks
+)
+```
+---
+# Directories and Colors
+```{r colors}
+# Define custom color palette for visualizations
+my_colors <- c(
+  "#9d183299", "#00A087FF", "#525ecc99", "#E9967A", "#4DBBD5FF", "#003C67FF",
+  "#386cb0", "#7E6148FF", "#ADB6B6FF", "#52a7cc99", "#F0E685FF", "#cc52c099",
+  "#6acc5299", "#DC143C", "#802268FF", "#ffbb78", "#3C548899", "#189b3699",
+  "#cc9b5299", "#1f0fdf99", "#ccebc5", "#42857599", "#868686FF", "#006400",
+  "#0A47FFFF", "#3B1B53FF", "#749B58FF", "#ccc05299", "#cc765299", "#1B1919FF",
+  "#00D68FFF", "#14FFB1FF", "#3C5488FF", "#8F7700FF", "#164194FF", "#0094CDFF",
+  "#FFDAB9", "#FF00FF", "#00FFFF", "green", "blue", "#480607"
+)
+
+# Define paths for saving RDS and figures
+rds_path_vst <- "/vast/projects/aml_multiome/Sn_vs_SC/rds_path_vst/"
+fig_path_stnx <- "/home/users/allstaff/ghamsari.r/seurat_figures/Sn_vs_SC_V4/"
+```
+---
+# Loading Required Packages
+```{r pkgs}
+script_title <- "02_Adding_metadata_BMMC_22_samples.Rmd"
+# Load necessary libraries
+pkgs <- c(
+  "Signac", "Seurat", "ggplot2", "SoupX", "scCustomize", "gridExtra",
+  "parallel", "clustree", "RColorBrewer", "patchwork", "igraph",
+  "tibble", "biomaRt", "reshape2", "dplyr", "grid", "unix", "future", "future.apply"
+)
+
+
+# Load packages
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# Log session information 
+sink(file.path(fig_path_stnx, paste0(script_title, "_sessionInfo.txt")))
+sessionInfo()
+sink()
+```
+
+# Load Seurat Objects  
+
+```{r}
+# Load the Seurat object list from an RDS file
+sobj_list <- readRDS(paste0(rds_path_vst, "01_SoupX_corrected_Seurat_object_list_22_samples_11sn_11sc.rds"))
+
+# Calculate the total number of cells across all samples
+cell_count <- sum(sapply(sobj_list, function(obj) length(obj$orig.ident)))
+cat("Total number of cells:", cell_count, "\n")  # Expected: 211590
+```
+
+# Gene Name Cleanup
+Fixing the issue with some gene names that caused errors in the subsequent steps.
+
+```{r}
+# Read the compressed TSV file into R
+features <- as.data.frame(read.table(
+  gzfile("/stornext/General/data/user_managed/grpu_mritchie_1/reza/projects/mat_seq/BMMC_luecken/cellranger_outputs/count_outputs/S1_D1_cell/outs/filtered_feature_bc_matrix/features.tsv.gz"),
+  sep = "\t", header = FALSE
+))
+# Process gene names to remove ".1" suffix
+sobj <- sobj_list$S1_D1_cell
+gene_list <- rownames(sobj)
+length(gene_list) #36601
+length(features$V2) #36601
+# Remove the .1 suffix from gene_list
+# Check the problematic genes
+problematic_genes <- setdiff(gene_list, features$V2)
+# # Remove the .1 suffix only from the problematic genes
+cleaned_gene_list <- gene_list
+cleaned_gene_list[gene_list %in% problematic_genes] <- gsub("\\.1$", "", gene_list[gene_list %in% problematic_genes])
+# length(cleaned_gene_list)
+problematic_genes <- setdiff(cleaned_gene_list, features$V2)
+print(problematic_genes) #0
+identical(features$V2, cleaned_gene_list) #TRUE
+# #concluded that the order of genes are similar.
+
+# Update metadata for each Seurat object
+for (obj in names(sobj_list)) {
+  cat("Processing:", obj, "\n")
+  sobj <- sobj_list[[obj]]
+  sobj@assays$RNA@meta.data$hgnc_symbol_original <- rownames(sobj)
+  gene_list <- rownames(sobj)
+  cleaned_gene_list <- gene_list
+  problematic_genes <- setdiff(gene_list, features$V2)
+  cleaned_gene_list[gene_list %in% problematic_genes] <- gsub("\\.1$", "", gene_list[gene_list %in% problematic_genes])
+  
+  if (identical(features$V2, cleaned_gene_list)) {
+    sobj@assays$RNA@meta.data$hgnc_symbol_10x <- cleaned_gene_list
+  } else {
+    cat("Warning: still problematic genes in:", obj, "\n")
+  }
+  
+  sobj@assays$RNA@meta.data$ensembl_gene_id <- features$V1
+  sobj_list[[obj]] <- sobj
+}
+
+```
+#Annotating Genes
+```{r}
+Ens_list <-  features$V1
+# Use biomaRt to retrieve gene annotations
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+gene_attributes <- c(
+  'hgnc_symbol', 'ensembl_transcript_id', 'ensembl_gene_id', 'gene_biotype', 
+  'start_position', 'end_position', 'chromosome_name', 'percentage_gene_gc_content', 
+  'description', 'transcript_biotype', 'transcript_start', 'transcript_end', 
+  'transcript_length', 'go_id', 'name_1006', 'namespace_1003'
+)
+gene_info <- getBM(
+  attributes = gene_attributes, filters = 'ensembl_gene_id', 
+  values = features$V1, mart = ensembl
+)
+
+# Add gene length and GC content categories
+gene_info$gene_length <- gene_info$end_position - gene_info$start_position
+gene_info$gene_length_bins <- cut(
+  gene_info$gene_length, breaks = c(0, 8077, 24399, 66502, Inf), 
+  labels = c("Short", "Short_to_Med", "Med_to_Long", "Long"), right = FALSE
+)
+gene_info$GC_bins <- cut(
+  gene_info$percentage_gene_gc_content, 
+  breaks = c(21.04, 39.71, 44.38, 51.40, 83.33), 
+  labels = c("GC_1st_Qu.39.71", "GC_Median_44.38", "GC_3rd_Qu_51.40", "GC_Max_83.33"), 
+  right = FALSE
+)
+
+length(rownames(gene_info)) #1161416 #1188315
+
+gene_info_unique <- gene_info[!duplicated(gene_info$ensembl_gene_id), ]
+dim(gene_info_unique) # 36283    15 # 35466    19
+
+length(Ens_list) #36601
+length(unique(Ens_list)) #36601
+
+# Identify genes that were not returned in the gene_info data
+missing_genes <- setdiff(Ens_list, gene_info_unique$ensembl_gene_id)
+cat("Number of missing genes:", length(missing_genes), "\n") #318 First I tryed with gene symbole and I got less genes so I used  Ensmble Id
+# 1135
+
+#############
+############# Adding meta data to Seurat objects 
+#############
+
+# Merge gene annotations with Seurat object metadata
+for (obj in names(sobj_list)) {
+  cat("Processing:", obj, "\n")
+  sobj <- sobj_list[[obj]]
+  
+  # Add a temporary row identifier to preserve the original order
+  sobj@assays$RNA@meta.data$original_order <- seq_len(nrow(sobj@assays$RNA@meta.data))
+  
+  # Merge with gene_info_unique
+  sobj@assays$RNA@meta.data <- merge(
+    sobj@assays$RNA@meta.data,
+    gene_info_unique,
+    by = "ensembl_gene_id",
+    all.x = TRUE
+  )
+  
+  # Restore the original order
+  sobj@assays$RNA@meta.data <- sobj@assays$RNA@meta.data[
+    order(sobj@assays$RNA@meta.data$original_order),
+  ]
+  
+  # Remove the temporary row identifier
+  sobj@assays$RNA@meta.data$original_order <- NULL
+  
+  # Update the object in the list
+  sobj_list[[obj]] <- sobj
+}
+
+identical(sobj_list$S1_D1_cell@meta.data$nCount_RNA, sobj_list_v0$S1_D1_cell@meta.data$nCount_RNA) ##TRUE
+identical(rownames(sobj_list$S1_D1_cell),rownames(sobj_list_v0$S1_D1_cell)) #TRUE
+
+```
+
+##Getting number of feature per gene and per sample
+```{r}
+# Calculate counts per gene and per sample
+for (obj in names(sobj_list)) {
+  sobj <- sobj_list[[obj]]
+  
+  # Total counts per gene
+  count_matrix <- sobj@assays$RNA$counts
+  nCount_per_gene <- rowSums(count_matrix)
+  nCount_RNA_update <- colSums(count_matrix)
+  nCount_per_sample <- sum(nCount_RNA_update)
+  
+  # Update metadata
+  if (identical(names(nCount_per_gene), rownames(sobj))) {
+    sobj@assays$RNA@meta.data$nCount_per_gene <- nCount_per_gene
+  }
+  if (identical(nCount_per_sample, sum(sobj@meta.data$nCount_RNA))) {
+    sobj@assays$RNA@meta.data$nCount_per_sample <- nCount_per_sample
+  }
+  
+  sobj_list[[obj]] <- sobj
+}
+```
+##Split Violin Plot Function
+```{r}
+# attribute="gene_length_bins"
+# Define the function that generates the plots
+#column_interest : for some gene_attributes the number of genes was very low so I decided to go with major ones.
+generate_violin_plots <- function(attribute, sobj_list, column_interest) {
+category_sums_list <- list()
+for (obj in names(sobj_list)) {
+  sobj <- sobj_list[[obj]]
+  
+  category_sums <- aggregate(sobj@assays$RNA@meta.data$nCount_per_gene ~ sobj@assays$RNA@meta.data[[attribute]], 
+                          data = sobj@assays$RNA@meta.data, sum)
+  
+  nCount_per_sample <-  unique(sobj@assays$RNA@meta.data$nCount_per_sample)
+  # Rename the columns
+  colnames(category_sums) <- c("column_name", "count_per_type")
+  category_sums$Percentage_count_per_sample <- category_sums$count_per_type / nCount_per_sample * 100
+  
+  # Add metadata
+  category_sums$donor <- obj
+  category_sums$Pair_sample <- gsub("_cell|_Nuclei", "", obj)
+  category_sums$Platform <- ifelse(grepl("cell", obj), "Sc", "Sn")
+  category_sums$Site <- gsub("(_.*)", "", obj)
+  category_sums$nCount_per_sample <- nCount_per_sample
+  category_sums <- category_sums[category_sums[["column_name"]] %in% column_interest,]
+  # Add the results to the list
+  category_sums_list[[obj]] <- category_sums
+}
+
+# Combine the data from all objects into one data frame for plotting
+combined_category_sums <- do.call(rbind, category_sums_list)
+
+# PDF setup for plots
+pdf(file = paste0(fig_path_stnx, "02_violin_paired_donors_vs_gene_attributes_by_", attribute, ".pdf"), width = 12, height = 16)
+
+features <- c("Percentage_count_per_sample", "count_per_type")
+categories <- unique(combined_category_sums$column_name)
+plots <- list()
+# feature <- "Percentage_count_per_sample"
+# category <- "Short"
+# Perform paired t-test or Wilcoxon signed-rank test and add significance labels to the title
+for (feature in features) {
+  for (category in categories) {
+    
+    # Filter the data for the current gene length category and group by Pair_sample
+    file.edit <- combined_category_sums %>%
+      dplyr::filter(column_name == category) %>%
+      dplyr::group_by(Pair_sample) %>%
+      mutate(
+        paired = seq_along(Pair_sample),
+        x_pos = case_when(Platform == "Sc" ~ -0.020, Platform == "Sn" ~ 0.020),
+        box_pos = case_when(Platform == "Sc" ~ -0.0, Platform == "Sn" ~ 0.0)
+      )
+    
+    # Perform Wilcoxon signed-rank test for paired data
+    test_result <- wilcox.test(file.edit[[feature]] ~ Platform, data = file.edit, paired = TRUE)
+    
+    # Check if p-value is significant (p < 0.05)
+    significance <- ifelse(test_result$p.value < 0.05, "Significant", "Not Significant")
+    p_value <- test_result$p.value
+    
+
+
+    # Plot generation
+    color_platform_map <- c("Sc" = "#00468B", "Sn" = "#8B0046")
+    fill_platform_map <- c("Sc" = "#6699CC", "Sn" = "#CC6677")
+    
+    plot <- ggplot(data = file.edit, aes_string(x = "0", y = feature)) +
+      introdataviz::geom_split_violin(aes(fill = Platform), alpha = 0.3, trim = FALSE, color = "transparent", width = 0.3, show.legend = FALSE) +
+      geom_line(aes(x = x_pos, group = Pair_sample, color = Site), position = position_dodge(0), alpha = 0.9, size = 0.05) +
+      geom_point(aes(x = x_pos, color = Site, group = paired), alpha = 0.85, size = 1.5, shape = 8, position = position_dodge(0)) +
+      geom_boxplot(aes(x = box_pos, fill = Platform), width = 0.025, alpha = 0.4, size = 0.05, show.legend = TRUE, 
+                   outlier.size = 0.5, color = "white", outlier.color = "gray", outlier.alpha = 0.6) +
+      stat_summary(aes(x = box_pos, fill = Platform, color = Platform), fun.data = "mean_se", geom = "pointrange", 
+                   show.legend = TRUE, position = position_dodge(0.025), size = 0.8, alpha = 1) +
+      theme_classic() +
+      theme(
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.y = element_text(size = 10),
+        plot.title = element_text(size = 15, hjust = 0.5, face = "bold"),
+        legend.text = element_text(size = 10),
+        legend.title = element_text(size = 10),
+        legend.position = "right",
+        legend.box.background = element_rect(fill = "transparent", color = "transparent")
+      ) +
+      guides(color = guide_legend(override.aes = list(size = 1, shape = 19))) +
+      scale_fill_manual(values = fill_platform_map, name = "Platform") + 
+      scale_color_manual(name = "Legends", values = c("S1" = "#661100", "S2" = "#888888", "S3" = "#008B45", "S4" = "#D55E00", 
+                                                      "Sc" = "#00468B", "Sn" = "#8B0046"),
+                         labels = c("S1" = "Lab1", "S2" = "Lab2", "S3" = "Lab3", "S4" = "Lab4", 
+                                    "Sc" = "scRNA-seq", "Sn" = "snRNA-seq")) +
+     
+     # Add the title 
+      ggtitle(paste(category, " from: ", attribute)) +
+      theme(plot.title = element_text(size = 14)) +  # Larger title font
+      # Add p-value as subtitle with smaller font
+      labs(subtitle = paste("Wilcoxon signed-rank test; p-value: ", round(p_value, 4))) +
+      theme(plot.subtitle = element_text(size = 10))  # Smaller subtitle font
+    
+    plots[[length(plots) + 1]] <- plot
+
+    if (length(plots) == 8) {
+      grid.arrange(grobs = plots, ncol = 2, nrow = 4) 
+      plots <- list()  # Reset the plots list
+    }
+  }
+}
+# Handle remaining plots if less than 8
+if (length(plots) > 0) {
+  grid.arrange(grobs = plots, ncol = 2, nrow = 4)
+}
+
+dev.off()
+
+}
+
+```
+##Plotting
+A split violin plot is generated for each feature, showing the distribution of values for the two platforms.
+```{r}
+###########################
+###############Gene length categories
+###########################
+gene_attrib <- "gene_length_bins"
+# Convert the table to a data frame for easier manipulation
+name_freq_df <- as.data.frame(table(sobj@assays$RNA@meta.data[[gene_attrib]]))
+# Sort the data frame by the frequency in descending order
+name_freq_sorted <- name_freq_df[order(-name_freq_df$Freq), ]
+print(name_freq_sorted)
+column_interest <- as.character(name_freq_sorted$Var1)
+generate_violin_plots(attribute=gene_attrib, sobj_list, column_interest=column_interest)
+
+###########################
+###############GC_bins 
+###########################
+gene_attrib <- "GC_bins"
+# Convert the table to a data frame for easier manipulation
+name_freq_df <- as.data.frame(table(sobj@assays$RNA@meta.data[[gene_attrib]]))
+# Sort the data frame by the frequency in descending order
+name_freq_sorted <- name_freq_df[order(-name_freq_df$Freq), ]
+print(name_freq_sorted) #
+column_interest <- as.character(name_freq_sorted$Var1)
+print(column_interest)
+generate_violin_plots(attribute=gene_attrib, sobj_list, column_interest=column_interest)
+
+
+
+###########################
+############### Biotype. lnConding and Conding proteins
+###########################
+gene_attrib <- "gene_biotype"
+# Convert the table to a data frame for easier manipulation
+name_freq_df <- as.data.frame(table(sobj@assays$RNA@meta.data[[gene_attrib]]))
+# Sort the data frame by the frequency in descending order
+name_freq_sorted <- name_freq_df[order(-name_freq_df$Freq), ]
+print(name_freq_sorted) #only interested in protein_coding and lncRNA
+column_interest <- as.character(name_freq_sorted$Var1)[1:2]
+print(column_interest)
+generate_violin_plots(attribute=gene_attrib, sobj_list, column_interest=column_interest)
+
+###########################
+############### name_1006
+###########################
+gene_attrib <- "name_1006"
+# Convert the table to a data frame for easier manipulation
+name_freq_df <- as.data.frame(table(sobj@assays$RNA@meta.data[[gene_attrib]]))
+# Sort the data frame by the frequency in descending order
+name_freq_sorted <- name_freq_df[order(-name_freq_df$Freq), ]
+print(name_freq_sorted[1:21,]) #only interested in first 2:21
+column_interest <- as.character(name_freq_sorted$Var1[2:21])
+print(column_interest)
+generate_violin_plots(attribute= gene_attrib, sobj_list, column_interest=column_interest)
+
+###########################
+############### namespace_1003
+###########################
+gene_attrib <- "namespace_1003"
+# Convert the table to a data frame for easier manipulation
+name_freq_df <- as.data.frame(table(sobj@assays$RNA@meta.data[[gene_attrib]]))
+# Sort the data frame by the frequency in descending order
+name_freq_sorted <- name_freq_df[order(-name_freq_df$Freq), ]
+print(name_freq_sorted) #
+column_interest <- as.character(name_freq_sorted$Var1[2:4])
+print(column_interest)
+generate_violin_plots(attribute=gene_attrib, sobj_list, column_interest=column_interest)
+
+###########################
+############### transcript_biotype
+###########################
+gene_attrib <- "transcript_biotype"
+# Convert the table to a data frame for easier manipulation
+name_freq_df <- as.data.frame(table(sobj@assays$RNA@meta.data[[gene_attrib]]))
+# Sort the data frame by the frequency in descending order
+name_freq_sorted <- name_freq_df[order(-name_freq_df$Freq), ]
+print(name_freq_sorted) #
+column_interest <- as.character(name_freq_sorted$Var1[1:5])
+print(column_interest)
+generate_violin_plots(attribute=gene_attrib, sobj_list, column_interest=column_interest)
+
+```
+
+#Cellranger report
+This chunk generates split violin plots for various features extracted from a Cell Ranger report, 
+comparing two platforms.
+```{r, with=20}
+library(readxl)
+df <- read_excel("/stornext/General/data/user_managed/grpu_mritchie_1/reza/projects/mat_seq/BMMC_luecken/cellranger_outputs/BMMC_Nuclei_vs_Cell_V4.xlsx")
+
+features <- c(
+    "Estimated_Number_of_Cells",
+    "Mean_Reads_per_Cell",
+    "Median_Genes_per_Cell",
+    "Number_of_Reads",
+    "Sequencing_Saturation",
+    "Reads_Mapped_to_Genome",
+    "Reads_Mapped_Confidently_to_Genome",
+    "Reads_Mapped_Confidently_to_Intergenic_Regions",
+    "Reads_Mapped_Confidently_to_Intronic_Regions",
+    "Reads_Mapped_Confidently_to_Exonic_Regions",
+    "Reads_Mapped_Confidently_to_Transcriptome",
+    "Reads_Mapped_Antisense_to_Gene",
+    "Fraction_Reads_in_Cells",
+    "Total_Genes_Detected",
+    "Median_UMI_Counts_per_Cell",
+    "Ambient_RNA_percentage_sample",
+    "Mean_MT_percentage_per_sample",
+    "Total_Count_RNA",
+    "nCount_Ambient_RNA",
+    "Total_Count_RNA_minus_MT", 
+    "doublet_percentage_norm",
+    "doublet_sct", "Basophils"
+    
+)
+# Adjusted width for the PDF
+pdf(file = paste0(fig_path_stnx, "02_violin_paired_10x_features.pdf"), width = 12, height = 16)
+
+plots <- list()
+for (feature in features) {
+    file.edit <- df %>%
+      dplyr::group_by(Pair_sample) %>%
+      mutate(
+        paired = seq(1:length(Pair_sample)),
+        x_pos = case_when(
+          Platform == "Sc" ~ -0.020,
+          Platform == "Sn" ~ 0.020
+        ),
+        box_pos = case_when(
+          Platform == "Sc" ~ -0.0,
+          Platform == "Sn" ~ 0.0
+        )
+      )
+         # Perform Wilcoxon signed-rank test for paired data
+    test_result <- wilcox.test(file.edit[[feature]] ~ Platform, data = file.edit, paired = TRUE)
+    
+    # Check if p-value is significant (p < 0.05)
+    significance <- ifelse(test_result$p.value < 0.05, "Significant", "Not Significant")
+    p_value <- test_result$p.value
+    
+    color_platform_map <- c("Sc" = "#00468B", "Sn" = "#8B0046")
+    fill_platform_map <- c("Sc" = "#6699CC", "Sn" = "#CC6677")
+
+    plot <- ggplot(data = file.edit, aes_string(x = "0", y = feature)) +
+      introdataviz::geom_split_violin(aes(fill = Platform), alpha = 0.3, trim = FALSE, color = "transparent", width = 0.3, show.legend = FALSE) +
+      geom_line(aes(x = x_pos, group = Pair_sample, color = Site), position = position_dodge(0), alpha = 0.9, size = 0.05) +
+      geom_point(aes(x = x_pos, color = Site, group = paired), alpha =0.85, size = 1.5, shape = 8, position = position_dodge(0)) +
+      geom_boxplot(aes(x = box_pos, fill = Platform), width = 0.025, alpha = 0.4, size = 0.05, fatten = NULL, show.legend = TRUE, outlier.size = 0.5, color = "white",
+                   outlier.color = "gray", outlier.alpha = 0.6) +
+      stat_summary(aes(x = box_pos, fill = Platform, color = Platform), fun.data = "mean_se", geom = "pointrange", show.legend = TRUE,
+                   position = position_dodge(0.025), size = 0.8, alpha = 1) +
+      theme_classic() +
+      theme(
+            axis.text.x = element_blank(),
+            axis.title.x = element_blank(),
+            axis.text.y = element_text(size = 10),
+            plot.title = element_text(size = 15, hjust = 0.5 , face = "bold"),
+            legend.text = element_text(size = 10),
+            legend.title = element_text(size = 10),
+            legend.position = "right",
+            legend.box.background = element_rect(fill = "transparent", color = "transparent")  # Optional: Remove box around legend
+      ) +
+      guides(color = guide_legend(override.aes = list(size = 1, shape = 19)))+
+  
+
+      scale_fill_manual(values = fill_platform_map,  name = "Platform") +
+      scale_color_manual(name = "Legends", values = c("S1" = "#661100", "S2" = "#888888", "S3" = "#008B45", "S4" = "#D55E00", "Sc" = "#00468B", "Sn" = "#8B0046"),  labels = c("S1" = "Lab1","S2" = "Lab2", "S3" = "Lab3", "S4" = "Lab4", "Sc" = "scRNA-seq", "Sn" = "snRNA-seq"))+
+      # Add the title 
+      ggtitle(feature) +
+      theme(plot.title = element_text(size = 14)) +  # Larger title font
+      # Add p-value as subtitle with smaller font
+      labs(subtitle = paste("Wilcoxon signed-rank test; p-value: ", round(p_value, 4))) +
+      theme(plot.subtitle = element_text(size = 10))  # Smaller subtitle font
+    
+    plots[[length(plots) + 1]] <- plot
+    if (length(plots) == 8) {
+        grid.arrange(grobs = plots, ncol = 2, nrow = 4) 
+        plots <- list()  # Reset the plots list
+    } 
+}
+
+# If there are remaining plots after the loop, arrange them on the final page
+if (length(plots) > 0) {
+  grid.arrange(grobs = plots, ncol = 2, nrow = 4)
+} 
+
+# Close the PDF file
+dev.off()
+
+```
+
+
+
+
+

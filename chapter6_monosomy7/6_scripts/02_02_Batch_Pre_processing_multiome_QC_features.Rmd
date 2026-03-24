@@ -1,0 +1,243 @@
+---
+title: "02_02_Batch_Pre_processing_multiome_QC_features"
+author: "Reza Ghamsari"
+date: "2024-08-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+all_times <- list()  
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now)
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  time_it = TRUE
+)
+```
+# Description
+
+This script adds quality control metrics to each sample's Seurat object prior to filtering. Due to the size of the dataset (22 samples), processing was distributed across six SLURM runs, each handling a sub-list of samples. For each sample, RNA-based QC metrics are calculated including mitochondrial, ribosomal, MALAT1, haemoglobin, and lineage marker gene percentages, as well as chromosome-level expression proportions (chrX, chrY, chr7). ATAC-based metrics including nucleosome signal, TSS enrichment, ENCODE blacklist fraction, and per-chromosome peak percentages are also computed. The annotated sub-lists are saved separately and loaded together in the following script.
+
+
+# Colors 
+```{r colors}
+my_colors <-c("#9d183299","#00A087FF", "#525ecc99","#E9967A", "#4DBBD5FF",  "#003C67FF", "#386cb0", "#7E6148FF",  "#ADB6B6FF", "#52a7cc99", "#F0E685FF", "#cc52c099",
+              "#6acc5299","#DC143C", "#802268FF" ,"#ffbb78", "#3C548899", "#189b3699", "#cc9b5299", "#1f0fdf99", "#ccebc5", "#cc527699", "#42857599", "#868686FF"
+              , "#006400", "#0A47FFFF" , "#3B1B53FF",  "#749B58FF" ,"#ccc05299", "#cc765299" , "#1B1919FF", "#00D68FFF" ,"#14FFB1FF","#3C5488FF" , "#8F7700FF" 
+              , "#164194FF" , "#0094CDFF" , "#FFDAB9", "#FF00FF","#00FFFF","green" , "blue",  "#480607")
+
+```
+# Configuration
+```{r config}
+project_root <- here::here()
+data_dir <- file.path(project_root, "data")
+output_dir <- file.path(project_root, "outputs")
+figures_dir <- file.path(project_root, "figures")
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(figures_dir, recursive = TRUE, showWarnings = FALSE)
+
+```
+
+# Loading Packages
+```{r pkgs}
+script_title <- "02_02_Batch_Pre_processing_multiome_QC_features"
+packages <- c(
+  "scales", "Seurat", "Signac", "ggplot2", "scCustomize", "gridExtra", 
+  "parallelly", "parallel", "BiocParallel", "clustree", "RColorBrewer", 
+  "patchwork", "igraph", "tibble", "ddqcR", "tidyr", "dplyr", "tidyverse", 
+  "forcats", "Matrix", "EnsDb.Hsapiens.v86", "org.Hs.eg.db", "AnnotationDbi", 
+  "biomaRt", "scDblFinder", "harmony", "pheatmap", "cowplot"
+)
+invisible(lapply(packages, library, character.only = TRUE))
+sink(file.path(figures_dir,paste0(script_title ,"_sessionInfo.txt")))
+sessionInfo()
+sink()
+```
+
+
+# Reading data
+```{r reading data}
+multiome_list_11AML_9_healthy_2AMS <- readRDS(file.path(data_dir, "01_02_merged_multiome_11AML_9_healthy_2AMS_before_doublet_and_qc_not_merged_v1.rds"))
+```
+
+# split the merged multiome data
+ The full list was too large to process in a single session, so it was split into 6 sub-lists,
+ each processed in a separate SLURM run. QC-passed barcodes are later used to subset the merged object.
+```{r split_batches}
+length(multiome_list_11AML_9_healthy_2AMS) #22
+# Seurat_merge_mutliome <- NULL
+multiome_list_1_3 <- multiome_list_11AML_9_healthy_2AMS[1:3]
+names(multiome_list_1_3)
+multiome_list_4_7 <- multiome_list_11AML_9_healthy_2AMS[4:7]
+names(multiome_list_4_7)
+multiome_list_8_11 <- multiome_list_11AML_9_healthy_2AMS[8:11]
+names(multiome_list_8_11)
+multiome_list_12_15 <- multiome_list_11AML_9_healthy_2AMS[12:15]
+names(multiome_list_12_15)
+multiome_list_16_19 <- multiome_list_11AML_9_healthy_2AMS[16:19]
+names(multiome_list_16_19)
+multiome_list_20_22 <- multiome_list_11AML_9_healthy_2AMS[20:22]
+names(multiome_list_20_22)
+
+```
+
+
+## Basic QC annotations
+Each batch was processed in a separate SLURM run.
+Uncomment the relevant batch_Number and multiome_list assignment before each run.
+```{r QC_annotations, fig.width=20}
+# #this is not a for loop, only change batch number in each run of slurm:
+# batch_Number=1
+# multiome_list <- multiome_list_1_3
+
+# batch_Number=2
+# multiome_list <- multiome_list_4_7
+
+# batch_Number=4
+# multiome_list <- multiome_list_8_11
+
+# batch_Number=3
+# multiome_list <- multiome_list_12_15
+
+# batch_Number=5
+# multiome_list <- multiome_list_16_19
+
+batch_Number=6
+multiome_list <- multiome_list_20_22
+# Reading Seurat lists
+batch_names <- c("list_1_3", "list_4_7", "list_8_11", "list_12_15", "list_16_19", "list_20_22")
+batch_name <- batch_names[batch_Number]
+print(batch_name)
+# biomart
+ensembl <- useMart("ensembl", dataset="hsapiens_gene_ensembl")
+chr7_genes <- getBM(
+  attributes = c('hgnc_symbol', 'chromosome_name'),
+  filters = 'chromosome_name',
+  values = '7',
+  mart = ensembl
+)
+chr7_genes <- chr7_genes$hgnc_symbol
+length(chr7_genes) # 1981
+chr7_genes <- chr7_genes[chr7_genes%in%rownames(multiome_list[[1]])]
+length(chr7_genes) # 1062
+###########
+chrX_genes <- getBM(
+  attributes = c('hgnc_symbol', 'chromosome_name'),
+  filters = 'chromosome_name',
+  values = 'X',
+  mart = ensembl
+)
+chrX_genes <- chrX_genes$hgnc_symbol
+length(chrX_genes) # 1881
+chrX_genes <- chrX_genes[chrX_genes%in%rownames(multiome_list[[1]])]
+length(chrX_genes) # 926
+#####
+chrY_genes <- getBM(
+  attributes = c('hgnc_symbol', 'chromosome_name'),
+  filters = 'chromosome_name',
+  values = 'Y',
+  mart = ensembl
+)
+chrY_genes <- chrY_genes$hgnc_symbol
+length(chrY_genes) # 469
+chrY_genes <- chrY_genes[chrY_genes%in%rownames(multiome_list[[1]])]
+length(chrY_genes) # 111
+chrMT_genes <- getBM(
+  attributes = c('hgnc_symbol', 'chromosome_name'),
+  filters = 'chromosome_name',
+  values = 'MT',
+  mart = ensembl
+)
+chrMT_genes <- chrMT_genes$hgnc_symbol
+length(chrMT_genes) # 37
+chrMT_genes <- chrMT_genes[chrMT_genes%in%rownames(multiome_list[[1]])]
+length(chrMT_genes) # 13
+
+#The genes HBB,HBA2 are both haemoglobin genes and so should only be expressed in red blood cells and nowhere else. IGKC is an antibody gene produced only by B cells.
+# MALAT1 is a long non-coding RNA that is predominantly localized in the nucleus, particularly in nuclear speckles which are subnuclear structures involved in the production and processing of pre-mRNA. Because of this localization, it would be expected that the signal for MALAT1 would be stronger in snRNA-seq data compared to scRNA-seq data, where the total RNA from the whole cell is being sequenced and the nuclear signal might be somewhat diluted by the presence of cytoplasmic RNAs
+featureList <- list (
+  # Quality Control Markers
+  percentage_MT = "^MT-",                  # Mitochondrial genes
+  percentage_RB = "^RP[SL]",               # Ribosomal genes
+  percentage_Malat1 = "MALAT1",            # Nuclear-enriched non-coding RNA
+  percentage_HB = "^HB[A-Z]*",
+  # Hematopoietic Lineage Markers
+  percentage_redblood.HBB_HBA2 = "^HB(B|A2)$",     # Red blood cell markers
+  percentage_plat= "PECAM1|PF4",          # Platelet markers
+  percentage_CD117 = "KIT",                # Hematopoietic stem cell marker
+  percentage_CD33 = "CD33",                # Myeloid cell marker
+  percentage_CD34 = "CD34",                # Hematopoietic stem/progenitor cell marker
+  percentage_FLT3 = "FLT3",                # Hematopoietic stem/progenitor cell marker
+  percentage_NPM1 = "NPM1",                # Leukemia marker
+  percentage_t_cells = "CD3E|CD4|CD8A",            # T cell markers
+  percentage_monocytes = "CD14|CD68",              # Monocyte/macrophage markers
+  percentage_granulocytes = "CSF3R|FCGR3B",        # Granulocyte markers
+  percentage_B_cell_markers = "MS4A1|CD79A|IGKC",       # B cell-specific markers
+  percentage_NK_cell_markers = "NCAM1",            # NK cell marker
+  percentage_endothelial_cells = "CDH5|VWF",       # Endothelial cell markers
+  percentage_erythroid_cells = "GYPA|HBA1|HBB",    # Erythroid cell markers
+  percentage_megakaryocytes = "ITGA2B|CD41",       # Megakaryocyte markers
+  # AML Associated Markers
+  percentage_CEBPA = "CEBPA",
+  percentage_RUNX1 = "RUNX1",
+  percentage_MLL = "KMT2A|MLL",
+  percentage_TP53 = "TP53",
+  percentage_IDH1 = "IDH1",
+  percentage_IDH2 = "IDH2",
+  percentage_TET2 = "TET2",
+  percentage_CBX7 = "CBX7",
+  percentage_DNMT3A = "DNMT3A",
+  # Cell Survival Markers
+  percentage_BCL2 = "BCL2",                        # Anti-apoptotic protein
+  percentage_BCL2L1 = "BCL2L1",                    # Anti-apoptotic protein
+  percentage_MCL1 = "MCL1",                        # Anti-apoptotic protein
+  percentage_Ig_variable_markers = "^IGHV|^IGKV|^IGLV|^TRAV|^TRBV|^TRDV|^TRGV", #these are very patinet spacific so probably must remove from the data
+  percentage_Ig_markers = "^IG[A-Z]*"
+)
+
+PercentageFeatures <- function(seuratObj) {
+  DefaultAssay(seuratObj) <- "RNA"
+for (featureName in names(featureList)) {
+    patterns <- featureList[[featureName]]
+    seuratObj[[featureName]] <- Seurat::PercentageFeatureSet(seuratObj, pattern = patterns)
+}
+#***********************************************************************
+seuratObj[["percentage_chr7_genes"]] <- Seurat::PercentageFeatureSet(seuratObj, features = chr7_genes)
+seuratObj[["percentage_chrMT_genes"]] <- Seurat::PercentageFeatureSet(seuratObj, features = chrMT_genes)
+seuratObj[["percentage_chrY_genes"]] <- Seurat::PercentageFeatureSet(seuratObj, features = chrY_genes)
+seuratObj[["percentage_chrX_genes"]] <- Seurat::PercentageFeatureSet(seuratObj, features = chrX_genes)
+
+DefaultAssay(seuratObj) <- "ATAC"
+seuratObj <- NucleosomeSignal(object = seuratObj)
+seuratObj <- TSSEnrichment(object = seuratObj, fast = TRUE)
+seuratObj$blacklist_fraction <- FractionCountsInRegion( object = seuratObj, assay = 'ATAC',regions = blacklist_hg38)
+seuratObj$percentage_chr7_peaks_temp <- Seurat::PercentageFeatureSet(seuratObj, pattern = "chr7")
+
+for (i in c(1:22, "X", "Y")) {
+  chr_pattern <- paste0("chr", i)
+  print(chr_pattern)
+  feature_name <- paste0("percentage_chr", i, "_peaks")
+  seuratObj[[feature_name]] <- Seurat::PercentageFeatureSet(seuratObj, pattern = chr_pattern)
+}
+
+  return(seuratObj)
+}
+
+multiome_list <- lapply(multiome_list, PercentageFeatures)
+saveRDS(multiome_list, file.path(data_dir, paste0("02_02_multiome_feature_pre_", batch_name, "_v1.rds"))) #saved as different batches
+```
+
+
+
+

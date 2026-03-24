@@ -1,0 +1,352 @@
+---
+title: "03_DoubletDetection_BMMC_22_samples"
+author: "Reza Ghamsari"
+date: "2024-08-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Setup chunk: Initialize timing hooks and global chunk options
+all_times <- list()  # Store the time for each chunk
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now)
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  time_it = TRUE
+)
+```
+
+ Directories and Colors
+```{r, colors}
+# Define custom colors for plots
+my_colors <- c("#802268FF", "#006400", "#525ecc99", "#1f0fdf99", "#480607", "#D55E00", 
+               "#164194FF", "#7E6148FF", "#ADB6B6FF", "#52a7cc99", "#F0E685FF", "#cc52c099", 
+               "#6acc5299", "#DC143C", "#802268FF", "#ffbb78", "#3C548899", "#189b3699", 
+               "#cc9b5299", "#1f0fdf99", "#ccebc5", "#42857599", "#868686FF", "#006400", 
+               "#0A47FFFF", "#3B1B53FF", "#749B58FF", "#ccc05299", "#cc765299", "#1B1919FF", 
+               "#00D68FFF", "#14FFB1FF", "#3C5488FF", "#8F7700FF", "#164194FF", "#0094CDFF", 
+               "#FFDAB9", "#FF00FF", "#00FFFF", "green", "blue", "#480607")
+
+# Define paths for saving RDS and figures
+rds_path_vst <- "/vast/projects/aml_multiome/Sn_vs_SC/rds_path_vst/"
+fig_path_stnx <- "/home/users/allstaff/ghamsari.r/seurat_figures/Sn_vs_SC_V4/"
+```
+# Loading Required Packages
+```{r pkgs}
+script_title <- "03_DoubletDetection_BMMC_22_samples"
+# Load necessary libraries
+pkgs <- c(
+  "Signac", "Seurat", "ggplot2", "SoupX", "scCustomize", "gridExtra",
+  "parallel", "clustree", "RColorBrewer", "patchwork", "igraph",
+  "tibble", "biomaRt", "reshape2", "dplyr", "grid", "unix", "future", "future.apply", "tidyverse"
+)
+
+# Load packages
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# Save session information for reproducibility
+sink(file.path(fig_path_stnx, paste0(script_title, "_sessionInfo.txt")))
+sessionInfo()
+sink()
+```
+---
+# Memory Configuration and Limits ----
+ Retrieve system memory details (total and available) and configure safe limits 
+for R, Slurm, and the future package to prevent memory overuse during analysis
+```{r memory}
+# Check available memory and set limits
+system_info <- system("free -b | grep Mem", intern = TRUE)
+mem_info <- strsplit(system_info, " +")[[1]]
+available_ram <- as.numeric(mem_info[4])
+total_memory_bytes <- as.numeric(mem_info[2])
+available_memory_bytes <- as.numeric(mem_info[6])
+
+# Print memory details
+print(paste("Total memory (bytes):", total_memory_bytes))
+print(paste("Available memory (bytes):", available_memory_bytes))
+
+# Set memory limits for the script
+slurm_mem_available_B <- as.numeric(Sys.getenv("SLURM_MEM_PER_NODE", unset = NA)) * 10^6
+Memory_to_use <- slurm_mem_available_B - (2000 * 2^20)  # Reserve 2GB for safety
+unix::rlimit_as(Memory_to_use, Memory_to_use)
+rlimit_core(cur = 55, max = 55)
+
+# Set future package memory limit
+options(future.globals.maxSize = 256000 * 1024^2)  # 25 GiB
+current_size_gib <- getOption("future.globals.maxSize") / 1024^3
+cat("Current future.globals.maxSize is:", current_size_gib, "GiB\n")
+```
+
+
+# Reading Data
+```{r, reading objects}
+# Load Seurat object list
+sobj_list <- readRDS(paste0(rds_path_vst, "01_SoupX_corrected_Seurat_object_list_22_samples_11sn_11sc.rds"))
+
+# Check if data is normalized
+identical(sobj_list_v0$S1_D1_cell@assays$RNA$counts, sobj_list_v0$S1_D1_cell@assays$RNA$data)  # FALSE
+```
+
+# Doublet Detection
+## Clustering Before Doublet Detection
+Perform clustering on Seurat objects before doublet detection
+```{r, clustering}
+length(sobj_list) #22
+
+processSeurat <- function(x) {
+    x <- SCTransform (x, vst.flavor = "v2", verbose = FALSE,new.assay.name = "SCT_doub", seed.use = 1448145)
+    message("Running PCA...")
+    x <- RunPCA(x, reduction.name= 'pca_doub', assay = "SCT_doub")
+    message("Finding Neighbors...")
+    x <- FindNeighbors(x, reduction = 'pca_doub', dims = 1:50, graph.name='graph_doub')
+    x <- FindClusters(x, graph.name = "graph_doub",resolution = 0.8, verbose = FALSE)
+    x@meta.data$doub_clusters <- x@meta.data$seurat_clusters
+    x@meta.data$seurat_clusters <- NULL
+   doub_meta.data <- x@meta.data
+    return(doub_meta.data)
+}
+# Parallel processing setup
+num_cores <- parallelly::availableCores() #56
+# Use multisession for stability (spawns separate R sessions instead of forking)
+plan(multisession, workers = num_cores - 4)
+# Apply clustering function to all objects
+doub_metadata_list <- future_lapply(sobj_list, processSeurat)
+length(doub_metadata_list) #22
+
+
+# Update Seurat objects with clustering results
+for (obj_name in names(sobj_list)) {
+  for (meta_name in names(doub_metadata_list)) {
+    
+    if (obj_name == meta_name) {
+      print(paste("Matching names:", obj_name == meta_name))
+      sobject <- sobj_list[[obj_name]]
+      doub_meta_obj <- doub_metadata_list[[meta_name]]
+      
+      # Check if row names in metadata match column names in Seurat object
+      if (identical(rownames(doub_meta_obj), colnames(sobject))) {
+        print(paste("identical barcodes:", identical(rownames(doub_meta_obj), colnames(sobject))))
+
+        sobject$doub_clusters <- doub_meta_obj$doub_clusters
+        sobj_list[[obj_name]] <- sobject
+      }
+      
+      # Display number of unique clusters
+      cluster_table <- table(sobject$doub_clusters)
+      print(sprintf("For %s, number of clusters found: %d", obj_name, length(unique(sobject$doub_clusters))))
+
+    }
+  }
+}
+sobj_list <- sobj_list[!sapply(sobj_list, is.null)]
+length(sobj_list) #22
+```
+
+## Running scDblFinder
+```{r, doublet detection}
+# The number of available cores
+num_cores <- parallelly::availableCores() #56
+bp <- MulticoreParam(num_cores-4, RNGseed=1234) 
+# Function for doublet finder 
+DOUBLET <- function(sobj) {
+  scDblFinder::scDblFinder(Seurat::GetAssayData(sobj, slot = "counts", assay = "RNA"), 
+                   clusters = sobj$doub_clusters,
+                   returnType = c("sce", "table", "full", "counts"),
+                   verbose = TRUE,
+                   BPPARAM = bp)
+}
+
+# Apply function to each object
+RNA_doublet_list_scdbfinder <- purrr::map(sobj_list, DOUBLET)
+scdb_metadata <- list()
+  for( obj in names(RNA_doublet_list_scdbfinder)) {
+    metadata <- RNA_doublet_list_scdbfinder[[obj]]@colData
+      scdb_metadata[[obj]] <- metadata
+    }
+```
+
+##Quantifying Doublets: Correlation with Experimental Platform and Number of Captured Cells
+```{r}
+
+MAKE_TABLE <- function(obj, id) {
+  df <- as.data.frame(table(obj$scDblFinder.class))
+  df$Sample <- id
+  return(df)
+}
+
+
+# Using map2 to also iterate over names of the list for Sample IDs
+combined_df <- purrr::map2_df(RNA_doublet_list_scdbfinder, names(RNA_doublet_list_scdbfinder), MAKE_TABLE)
+
+reshaped_df <- combined_df %>%
+  spread(key = Var1, value = Freq)
+
+
+reshaped_df <- reshaped_df %>%
+  mutate(doublet_percentage = 100 * doublet / (doublet + singlet))%>%
+  mutate(total_cell =  doublet + singlet)
+
+
+write.csv(reshaped_df, file = paste0(fig_path_stnx, "03_Doublet_percentage_SCT.csv"), row.names = T)
+# Doublet rates appear to be more strongly correlated with the number of loaded cells rather than the platform type.
+
+reshaped_df$Pair_sample <- gsub("_cell|_Nuclei", "", reshaped_df$Sample)
+reshaped_df$Platform <- ifelse(grepl("cell", reshaped_df$Sample), "Sc", "Sn")
+reshaped_df$Site <- gsub("(_.*)", "", reshaped_df$Sample)
+
+
+# Linear regression model with both Platform and total_cell as predictors
+lm_result <- lm(doublet_percentage ~ total_cell + Platform, data = reshaped_df)
+summary(lm_result)
+# to check if there's an interaction between total_cell and Platform by including an interaction term in the model. 
+lm_interaction_result <- lm(doublet_percentage ~ total_cell * Platform, data = reshaped_df)
+
+# text file to save the summary
+sink(paste0(fig_path_stnx, "03_Doublet_lm_interaction_result.txt"))
+
+# Print the model summary to the file
+summary(lm_interaction_result)
+
+# Close the sink (stop saving to the file)
+sink()
+
+plot(lm_interaction_result)
+
+
+
+# Scatter plot with total_cell on the x-axis and doublet_percentage on the y-axis
+
+plot1 <- ggplot(reshaped_df, aes(x = total_cell, y = doublet_percentage)) +
+  geom_point(aes(fill = Pair_sample, shape = Platform), alpha = 0.7, size = 3) +  # Use different shapes for Platform and fill for Pair_sample
+  geom_smooth(aes(group = Platform, color = Platform), method = "lm", se = FALSE, linetype = "solid", size = 1) +  # Color lines by Platform
+  labs(
+    title = "Doublet Percentage vs Total Cells by Platform",
+    x = "Total Number of Cells",
+    y = "Doublet Percentage"
+  ) +
+  theme_minimal() +
+  scale_fill_manual(values = my_colors) +  # Apply colors for Pair_sample (points) using 'fill'
+  scale_color_manual(values = c("Sc" = "#00468B", "Sn" = "#8B0046")) +  # Apply colors for Platform regression lines
+  scale_shape_manual(values = c("Sc" = 24, "Sn" = 21)) +  # Apply different shapes for Platform (Circle for Sc and Triangle for Sn)
+  theme(
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10),
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12),
+    panel.grid.major = element_blank(),  # Remove major grid lines
+    panel.grid.minor = element_blank()   # Remove minor grid lines
+  )
+
+plot2 <- ggplot(reshaped_df, aes(x = total_cell, y = doublet_percentage)) +
+  geom_point(aes(fill = Pair_sample), alpha = 0.7, size = 3, shape = 22) +  # Use filled diamond (Shape 23)
+  geom_smooth(aes(group = Platform, color = Platform), method = "lm", se = FALSE, linetype = "solid", size = 1) +  # Color lines by Platform
+  labs(
+    title = "Doublet Percentage vs Total Cells by Platform",
+    x = "Total Number of Cells",
+    y = "Doublet Percentage"
+  ) +
+  theme_minimal() +
+  scale_fill_manual(values = my_colors) +  # Apply colors for Pair_sample (points) using 'fill'
+  scale_color_manual(values = c("Sc" = "#00468B", "Sn" = "#8B0046")) +  # Apply colors for Platform regression lines
+  theme(
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10),
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12),
+    panel.grid.major = element_blank(),  # Remove major grid lines
+    panel.grid.minor = element_blank()   # Remove minor grid lines
+  )
+# PDF setup for plots
+pdf(file = paste0(fig_path_stnx, "03_scatter_doublet_vs_total_Cells_paired_donors.pdf"), width = 18, height = 9)
+
+grid.arrange(plot1, plot2, ncol = 2)  # Place plots side by side
+dev.off()
+```
+
+
+##Adding Doublet annotations to seurat objects
+```{r, integrating the annotation}
+for (i in names(sobj_list)) {
+  for( j in names(RNA_doublet_list_scdbfinder)) {
+    if (i == j) {
+      print(paste("Checking identity for", i))
+      is_identical <- identical(rownames(sobj_list[[i]]@meta.data),
+                                colnames(RNA_doublet_list_scdbfinder[[j]]))
+      print(is_identical)
+    }
+  }
+}
+
+
+
+for (i in names(sobj_list)) {
+  for( j in names(RNA_doublet_list_scdbfinder)) {
+    if (i == j) {
+      sobj_list[[i]]@meta.data$scDblFinder_RNA_SCT = RNA_doublet_list_scdbfinder[[j]]$scDblFinder.class
+    }
+  }
+}
+
+
+
+for (i in names(sobj_list)) {
+  for( j in names(RNA_doublet_list_scdbfinder)) {
+    if (i == j) {
+      print(paste("Checking identity for", i))
+      is_identical <- identical(sobj_list[[i]]@meta.data$scDblFinder_RNA_SCT,
+                                RNA_doublet_list_scdbfinder[[j]]$scDblFinder.class)
+      print(is_identical)
+    }
+  }
+}
+
+saveRDS(sobj_list, paste0(rds_path_vst, "03_Doublet_SoupX_corrected_gene_annotations_Seurat_object_list_22_samples_11sn_11sc.rds"))
+
+```
+##UMAP Visualization of Detected Doublets
+```{r umap}
+processUMAP <- function(x) {
+    x <- SCTransform (x, vst.flavor = "v2", verbose = FALSE,new.assay.name = "SCT_doub", seed.use = 1448145)
+    message("Running PCA...")
+    x <- RunPCA(x, reduction.name= 'pca_doub', assay = "SCT_doub")
+    message("Finding Neighbors...")
+    x <- RunUMAP(x, reduction = 'pca_doub', dims = 1:50, reduction.name = 'umap.dbr', reduction.key = 'db_UMAP_')
+    return(x)
+}
+
+num_cores <- parallelly::availableCores() #56
+# Using multisession
+plan(multisession, workers = num_cores - 4)
+doub_umap_list <- future_lapply(sobj_list, processUMAP)
+
+plot_list <- list()
+for (obj in names(doub_umap_list)){
+  sobj <- doub_umap_list[[obj]]
+
+p <- DimPlot(object =  sobj ,  reduction = "umap.dbr", group.by = "scDblFinder_RNA_SCT" , cols=c("#00468B",  "#8B0046")) + ggtitle(paste0("Doublets distribution on uMAP for sample: ", obj))+
+  theme(
+    plot.title = element_text(size = 6)  
+  )
+  
+plot_list[[obj]] <- p}
+
+
+# Combine plots into a grid: 5 columns per row
+combined_plot <- wrap_plots(plot_list, ncol = 5)
+ggsave(paste0(fig_path_stnx, "03_umap_doublet_Cells_paired_donors.pdf"), combined_plot, width = 20, height = 20)
+
+```
+
+

@@ -1,0 +1,638 @@
+---
+title: "04_merge_object_processing_clustering.Rmd"
+author: "Reza Ghamsari"
+date: "2024-09-04"
+output: html_document
+---
+```{r setup, include=FALSE}
+all_times <- list() 
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now)
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  time_it = TRUE
+)
+
+```
+
+
+# Colors 
+```{r colors}
+my_colors <-c("#9d183299","#00A087FF", "#525ecc99","#E9967A", "#4DBBD5FF",  "#003C67FF", "#386cb0", "#7E6148FF",  "#ADB6B6FF"
+              , "#52a7cc99", "#F0E685FF", "#cc52c099",  "#6acc5299","#DC143C", "#802268FF" ,"#ffbb78", "#3C548899", "#189b3699",
+              "#cc9b5299", "#1f0fdf99", "#ccebc5", "#cc527699", "#42857599", "#868686FF", "#006400", "#0A47FFFF" , "#3B1B53FF", 
+              "#749B58FF" ,"#ccc05299", "#cc765299" , "#1B1919FF", "#00D68FFF" ,"#14FFB1FF","#3C5488FF" , "#8F7700FF" , "#164194FF" ,
+              "#0094CDFF" , "#FFDAB9", "#FF00FF","#00FFFF","green" , "blue",  "#480607")
+```
+# Configuration
+```{r config}
+project_root <- here::here()
+data_dir <- file.path(project_root, "data")
+output_dir <- file.path(project_root, "outputs")
+figures_dir <- file.path(project_root, "figures")
+
+# Create directories if they don't exist
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(figures_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+
+# Loading Packages
+```{r pkgs}
+script_title <- "04_merge_object_processing_clustering"
+packages <- c(
+  "scales", "Seurat", "Signac", "ggplot2", "scCustomize", "gridExtra", 
+  "parallelly", "parallel", "BiocParallel", "clustree", "RColorBrewer", 
+  "patchwork", "igraph", "tibble", "ddqcR", "tidyr", "dplyr", "tidyverse", 
+  "forcats", "Matrix", "EnsDb.Hsapiens.v86", "org.Hs.eg.db", "AnnotationDbi", 
+  "biomaRt", "scDblFinder", "harmony", "pheatmap", "cowplot"
+)
+
+invisible(lapply(packages, library, character.only = TRUE))
+
+sink(file.path(figures_dir, paste0(script_title ,"_sessionInfo.txt")))
+sessionInfo()
+sink()
+```
+
+
+
+
+
+# Reading data
+```{r reading data}
+Merge_obj  <- readRDS(file.path(output_dir, "03_merged_object_11AML_9healthy_2AMS_with_merged_meta_data_after_qc_filtered_features_ch7_removed.rds")) 
+table(Merge_obj$health_condition)
+# AML_monosomy AML_non_monosomy   healthy_donors 
+#   25380            56709            56788 
+### Changing annotation
+Merge_obj$health_condition <- ifelse(Merge_obj$donor == "Sample_16", "AML_monosomy", Merge_obj$health_condition)
+table(Merge_obj$health_condition)
+ # AML_monosomy AML_non_monosomy   healthy_donors 
+ #     28644            53445            56788 
+```
+# Random Quality Check
+```{r}
+Merge_obj$health_donor <- paste0(Merge_obj$health_condition,"_", Merge_obj$donor)
+Idents(Merge_obj) <- Merge_obj$health_donor
+p <- VlnPlot(Merge_obj, features = "percentage_chr7_peaks", alpha = 0.1, cols = my_colors) +
+  geom_hline(yintercept = 3.7, linetype = "dashed", color = "red", size = 1) +
+  annotate("text", x = Inf, y = 3.7,hjust = 2, vjust=-0.5,
+           label = "3.7", color = "red",  size = 6)+
+ geom_hline(yintercept = 3, linetype = "dashed", color = "gray", size = 1) +
+   annotate("text", x = Inf, y = 3, hjust = 2, vjust=-0.5,
+           label = "3", color = "gray",  size = 6)+ ggtitle("Percentage of Ch7 peaks in each Cell across different donors")
+ggsave(file.path(figures_dir, "04_ch7_peaks_percentage_violine.png"), plot = p, width = 30, height = 20, dpi = 300)
+
+p <- VlnPlot(Merge_obj, features = "percentage_chr7_genes", alpha = 0.1,  raster = FALSE, cols = my_colors, log=TRUE) +
+ ggtitle("Percentage of Ch7 genes in each Cell across different donors")
+
+ggsave(file.path(figures_dir, "04_ch7_genes_percentage_violine.png"), plot = p, width = 30, height = 20, dpi = 300)
+
+```
+# Cell-Cycle Scoring and Regression
+"In some cases, we’ve found that this can negatively impact downstream analysis, particularly in differentiating processes (like murine hematopoiesis), where stem cells are quiescent and differentiated cells are proliferating (or vice versa). 
+In this case, regressing out all cell cycle effects can blur the distinction between stem and progenitor cells as well.
+As an alternative, we suggest regressing out the difference between the G2M and S phase scores. 
+This means that signals separating non-cycling cells and cycling cells will be maintained, but differences in cell cycle phase among proliferating cells (which are often uninteresting), will be regressed out of the data"
+
+https://satijalab.org/seurat/articles/cell_cycle_vignette
+
+#DimRed 
+Here I used Seurat default hvgs based on sctransform ("V2") as it gave me more common HV genes across different samples before. So i thought it will give me more robust results across samples. I also added some marker genes to improve clusteing based on cell types. However i did not use common hvg here as I am cluster each sample sepratly.
+
+```{r DimRed fig.width=30, fig.height=10}
+
+##################################.  RNA analysis
+identical(Merge_obj@assays$RNA$counts, Merge_obj@assays$RNA$data) #TRUE
+DefaultAssay(Merge_obj) <- "RNA"
+
+Merge_obj <-  NormalizeData(Merge_obj, assay="RNA") 
+Merge_obj <- FindVariableFeatures(Merge_obj, selection.method = "vst", nfeatures= 3000, assay="RNA")
+Merge_obj <-  ScaleData(Merge_obj, assay="RNA",  vars.to.regress = "CellCycle.Difference") 
+Merge_obj <- RunPCA(Merge_obj, reduction.name='pca_vst_std', reduction.key = "pca_vst_std_PC_",assay = "RNA" )
+
+
+##################################.  ATAC analysis
+DefaultAssay(Merge_obj) <- "ATAC"
+identical(Merge_obj@assays$ATAC@data, Merge_obj@assays$ATAC@counts) #TRUE
+Merge_obj <- RunTFIDF(Merge_obj, assay= "ATAC")
+Merge_obj <- FindTopFeatures(Merge_obj, min.cutoff = 'q5' ,  assay= "ATAC")
+Merge_obj <- RunSVD(Merge_obj, reduction.name= 'lsi_std_TFIDF1_q5',  reduction.key = "std_TFIDF1_LSI_", assay= "ATAC", slot = "data")
+
+#####################################################################Batch effect
+
+##################################  RNA Harmony
+DefaultAssay(Merge_obj) <- "RNA"
+Merge_obj <- RunHarmony(object = Merge_obj, group.by.vars = 'donor', reduction = 'pca_vst_std', assay.use = 'RNA', project.dim = FALSE,  n.seed = 1, reduction.save = "harmony_RNA_seurat4") #Harmony converged after 7 iterations
+
+##################################.  ATAC Harmony
+DefaultAssay(Merge_obj) <- "ATAC"
+Merge_obj <- RunHarmony(object = Merge_obj, group.by.vars = 'donor', reduction = 'lsi_std_TFIDF1_q5', assay.use = 'ATAC', project.dim = FALSE, n.seed = 1, reduction.save = "harmony_ATAC_seurat4") #Harmony converged after 8 iterations
+
+
+####################################################################.  WNN
+Merge_obj <- FindMultiModalNeighbors(
+      object = Merge_obj, knn.graph.name = "wknn_intgd_atac_h4_rna_h4_d2_40_1_40_k30",
+  snn.graph.name = "wsnn_intgd_atac_h4_rna_h4_d2_40_1_40_k30",
+  weighted.nn.name = "weighted.nn_intgd_atac_h4_rna_h4_d2_40_1_40_k30",
+  reduction.list = list("harmony_ATAC_seurat4", "harmony_RNA_seurat4"),
+dims.list = list(2:40, 1:40), k.nn = 30, verbose = TRUE, modality.weight.name= list("weight_harmony_ATAC_seurat4_d2_40_1_40_k30", "weight_integrated.harmony4_d2_40_1_40_k30")
+    )
+
+
+Merge_obj <- RunUMAP(Merge_obj, nn.name = "weighted.nn_intgd_atac_h4_rna_h4_d2_40_1_40_k30", reduction.name = 'umap.intgd_atac_h4_rna_h4_d2_40_1_40_k30_wnn', reduction.key = 'intgd_atac_h4_rna_h4_d2_40_1_40_k30_wnnUMAP_')
+
+
+saveRDS(Merge_obj@reductions, file.path(output_dir, "04_reductions_atac_h4_rna_h4_d2_40_1_40_k30_v0_all_cells_regress_cc.rds"))
+saveRDS(Merge_obj@graphs, file.path(output_dir, "04_graphs_atac_h4_rna_h4_d2_40_1_40_k30_all_cells_regress_cc.rds"))
+
+```
+
+# Clustering
+
+                 @
+                / \
+               /   \
+              *     #
+             / \     / \
+            +   =   %   &
+
+
+
+
+```{r clustering, fig.width=30, fig.height=5}
+
+resolutions <- unique(c(0.001, 0.0025 ,seq(0.005, 0.1, 0.01), seq(0.1, 1.5, 0.2), seq(2, 3, 0.5)))
+
+# Extracting the graph from the Seurat object (to use less memory)
+graph <- Merge_obj[["wsnn_intgd_atac_h4_rna_h4_d2_40_1_40_k30"]]
+
+# Defining the clustering function
+ClusterParallel <- function(graph, resolution) {
+  clusters <- Seurat:::FindClusters.default(
+    object = graph, 
+    algorithm = 1, 
+    verbose = TRUE, 
+    random.seed = 0, 
+    resolution = resolution,  
+    n.iter = 10
+  )
+  return(clusters)
+}
+
+# Performing parallel clustering across different resolutions
+clustering_list <- mclapply(
+  resolutions, 
+  function(res) ClusterParallel(graph, resolution = res), 
+  mc.cores = detectCores() - 5, 
+  mc.preschedule = FALSE
+)
+
+clustering_result <- do.call(cbind, clustering_list)
+
+saveRDS(clustering_result, file.path(output_dir, "04_clustering_result_h4_rna_h4_d2_40_1_40_k30_v0_all_cells_regress_cc_138877cells.rds"))
+
+# To ensure column names are unique by appending a suffix to duplicates
+colnames(clustering_result) <- make.unique(colnames(clustering_result))
+
+
+clustree_plot <- clustree(clustering_result, prefix = "res.", node_alpha = 0.5) +
+    scale_color_manual(values = my_colors) +
+    guides(color = guide_legend(ncol = 2)) +
+    ggtitle("22 wsnn_intgd_atac_h4_rna_h4_d2_40_1_40_k30_regress_cc_138877cells")
+
+pdf_file <- file.path(figures_dir, "04_Clustree_h4_rna_h4_d2_40_1_40_k30_v0_all_cells_regress_cc_138877cells.pdf")
+pdf(pdf_file, width = 18, height = 30)
+print(clustree_plot)
+dev.off()
+
+table(clustering_result$res.0.025)
+clustering_result_refine <- subset(
+  x = clustering_result, 
+    res.0.001 == "0" 
+)
+
+```
+
+# pheatmap for majority vote
+
+```{r pheatmap}
+clustering_result <- readRDS(file.path(output_dir, "04_clustering_result_h4_rna_h4_d2_40_1_40_k30_v0_all_cells_regress_cc_138877cells.rds"))
+
+clustering_result <- subset(
+  x = clustering_result, 
+    res.0.001 == "0" 
+)
+
+pdf_file <- file.path(fig_path_stnx, "04_Composition_plot_atac_h4_rna_h4_d2_40_1_40_k30_22_res.0.015_test.pdf")
+pdf(pdf_file, width = 30, height = 5)
+
+colGEX <- c("#ccc05299", "#9d183299", "#00A087FF")
+
+plot_settings <- list(
+  list(field = "donor",
+       title = "donor"),
+  list(field = "cell_type_Lucken",
+       title = "cell_type_Lucken"),
+  list(field = "celltypes_20samples_wsnn_intgd_atac_h4_rna_h4_d2_40_1_40_k20_res.0.015_20",
+       title = "celltypes_20samples_wsnn_intgd_atac_h4_rna_h4_d2_40_1_40_k20_res.0.015_20n"),
+  list(field = "donor_main_clusters",
+       title = "cluster_5_main_per_sample")
+)
+
+
+for (ps in plot_settings) {
+  Composition_Data_cell_type <- as.matrix(
+    prop.table(table(clustering_result$res.0.015,
+                     Merge_obj@meta.data[[ps$field]]),
+               margin = 2)
+  )
+  
+  pheatmap(
+    Composition_Data_cell_type,
+    color = colGEX,
+    cluster_rows = FALSE,
+    cutree_cols = 2,
+    cluster_cols = FALSE,
+    display_numbers = TRUE,
+    angle_col = 315,
+    width = 8,
+    height = 15,
+    main = paste0(
+      "clustering_result_h4_rna_h4_d2_40_1_40_k30_all_cells_regress_cc_138877_cells res.0.015 \n ",
+      ps$title
+    ),
+    fontsize = 10,
+    fontsize_number = ifelse(ps$field == "donor", 15, ifelse(ps$field == "donor_main_clusters", 5, 20)),
+    number_format = "%.2f",
+    number_color = "black"
+  )
+}
+
+dev.off()
+
+    
+```
+
+
+
+
+
+
+#Generate UMAPs for Multiple Metadata Groupings
+```{r UMAPs, fig.width=10, fig.height=10}
+Merge_obj@reductions$umap.intgd_atac_h4_rna_h4_d2_40_2_40_k30_wnn
+p1 <-  DimPlot(Merge_obj, reduction = "umap.intgd_atac_h4_rna_h4_d2_40_1_40_k30_wnn", group.by = "Monosomy_cutoff", label = FALSE, label.size = 4.5,alpha = 0.3, repel = TRUE, raster=FALSE, raster.dpi=c(2000, 2000), cols=c( "#197EC0CC","#1A999399", "#C8081399"),  pt.size = 0.01) + ggtitle("9_healthy_11_AML_2AMS_132445_cells;   harmony; wnn, Monosomy_cutoff")
+p2 <- DimPlot(Merge_obj, reduction = "umap.intgd_atac_h4_rna_h4_d2_40_1_40_k30_wnn", group.by = "wsnn_intgd_atac_h4_rna_h4_d2_40_1_40_k30_res.0.015", label = FALSE, label.size = 4.5,alpha = 0.2, repel = TRUE, raster=FALSE, raster.dpi=c(2000, 2000), cols=my_colors,  pt.size = 0.01) + ggtitle("9_healthy_11_AML_2AMS_132445_cells")
+p3 <- DimPlot(Merge_obj, reduction = "umap.intgd_atac_h4_rna_h4_d2_40_1_40_k30_wnn", group.by = "Monosomy_cutoff", label = FALSE, label.size = 4.5,alpha = 0.2, repel = TRUE, raster=FALSE, raster.dpi=c(2000, 2000), cols=my_colors,  pt.size = 0.01) + ggtitle("9_healthy_11_AML_2AMS_132445_cells")
+p4 <- DimPlot(Merge_obj, reduction = "umap.intgd_atac_h4_rna_h4_d2_40_1_40_k30_wnn", group.by = "health_condition", label = FALSE, label.size = 4.5,alpha = 0.2, repel = TRUE, raster=FALSE, raster.dpi=c(2000, 2000), cols=c( "#C8081399","#F39B7FFF", "#1A999399"),  pt.size = 0.01) + ggtitle("9_healthy_11_AML_2AMS_132445_cells")
+p5 <- DimPlot(Merge_obj, reduction = "umap.intgd_atac_h4_rna_h4_d2_40_1_40_k30_wnn", group.by = "donor", label = FALSE, label.size = 4.5,alpha = 0.2, repel = TRUE, raster=FALSE, raster.dpi=c(2000, 2000), cols=my_colors,  pt.size = 0.01) + ggtitle("17samples_uMAPs_115991 Cells;   harmony; wnn, donor")
+p6 <- DimPlot(Merge_obj, reduction = "umap.intgd_atac_h4_rna_h4_d2_40_1_40_k30_wnn", group.by = "nCount_ATAC_raw_quantile_merged", label = FALSE, label.size = 4.5,alpha = 0.4, repel = TRUE, raster=FALSE, raster.dpi=c(2000, 2000), cols=my_colors,  pt.size = 0.01) + ggtitle("9_healthy_11_AML_2AMS_132445_cells")
+p7 <- DimPlot(Merge_obj, reduction = "umap.intgd_atac_h4_rna_h4_d2_40_1_40_k30_wnn", group.by = "Phase", label = FALSE, label.size = 4.5,alpha = 0.2, repel = TRUE, raster=FALSE, raster.dpi=c(2000, 2000), cols=c( "#1A999399","#197EC0CC", "#C8081399"),  pt.size = 0.01) + ggtitle("9_healthy_11_AML_2AMS_132445_cells")
+p8 <- DimPlot(Merge_obj, reduction = "umap.intgd_atac_h4_rna_h4_d2_40_1_40_k30_wnn", group.by = "scDblFinder_Doublets", label = FALSE, label.size = 4.5,alpha = 0.2, repel = TRUE, raster=FALSE, raster.dpi=c(2000, 2000), cols=c( "#C8081399","#197EC0CC", "#1A999399"),  pt.size = 0.01) + ggtitle("9_healthy_11_AML_2AMS_132445_cells")
+p9 <- DimPlot(Merge_obj_20, reduction = "umap.intgd_atac_h4_rna_h4_d2_40_1_40_k30_wnn", group.by = "celltypes_20samples_wsnn_intgd_atac_h4_rna_h4_d2_40_1_40_k20_res.0.015_20", label = FALSE, label.size = 4.5,alpha = 0.4, repel = TRUE, raster=FALSE, raster.dpi=c(2000, 2000), cols=c( "#197EC0CC","#1A999399", "#C8081399", "#F39B7FFF"),  pt.size = 0.01) + ggtitle("9_healthy_11_AML_91377_cells")
+p10 <-   DimPlot(Merge_obj_20, reduction = "umap.intgd_atac_h4_rna_h4_d2_40_1_40_k30_wnn", group.by = "cell_type_Rachel_v3_20", label = FALSE, label.size = 4.5,alpha = 0.4, repel = TRUE, raster=FALSE, raster.dpi=c(2000, 2000), cols=my_colors,  pt.size = 0.01) + ggtitle("9_healthy_11_AML_91377_cells")
+p11 <-   DimPlot(Merge_obj_20, reduction = "umap.intgd_atac_h4_rna_h4_d2_40_1_40_k30_wnn", group.by = "Monosomy_cutoff", label = FALSE, label.size = 4.5,alpha = 0.4, repel = TRUE, raster=FALSE, raster.dpi=c(2000, 2000), cols=my_colors,  pt.size = 0.01) + ggtitle("9_healthy_11_AML_91377_cells; harmony/ cell_type_Rachel_v3_20; wnn")
+p12 <-   DimPlot(Merge_obj_20, reduction = "umap.intgd_atac_h4_rna_h4_d2_40_1_40_k30_wnn", group.by = "Monosomy_cutoff", label = FALSE, label.size = 4.5,alpha = 0.4, repel = TRUE, raster=FALSE, raster.dpi=c(2000, 2000), cols=my_colors,  pt.size = 0.01) + ggtitle("9_healthy_11_AML_91377_cells; harmony/ cell_type_Rachel_v3_20; wnn")
+p13 <-   DimPlot(Merge_obj_20, reduction = "umap.intgd_atac_h4_rna_h4_d2_40_1_40_k30_wnn", group.by = "donor", label = FALSE, label.size = 4.5,alpha = 0.4, repel = TRUE, raster=FALSE, raster.dpi=c(2000, 2000), cols=my_colors,  pt.size = 0.01) + ggtitle("9_healthy_11_AML_91377_cells; harmony/ cell_type_Rachel_v3_20; wnn")
+p14 <-  DimPlot(Merge_obj_luk, reduction = "umap.intgd_atac_h4_rna_h4_d2_40_1_40_k30_wnn", group.by = "cell_type_Lucken", label = FALSE, label.size = 4.5,alpha = 0.4, repel = TRUE, raster=FALSE, raster.dpi=c(2000, 2000), cols=my_colors,  pt.size = 0.01) + ggtitle("9_healthy_37329_cells; harmony; wnn")
+p15 <-  DimPlot(Merge_obj_luk, reduction = "umap.intgd_atac_h4_rna_h4_d2_40_1_40_k30_wnn", group.by = "donor", label = FALSE, label.size = 4.5,alpha = 0.4, repel = TRUE, raster=FALSE, raster.dpi=c(2000, 2000), cols=my_colors,  pt.size = 0.01) + ggtitle("9_healthy_37329_cells; harmony; wnn")
+p16 <-  DimPlot(Merge_obj_luk, reduction = "umap.intgd_atac_h4_rna_h4_d2_40_1_40_k30_wnn", group.by = "celltypes_20samples_wsnn_intgd_atac_h4_rna_h4_d2_40_1_40_k20_res.0.015_20", label = FALSE, label.size = 4.5,alpha = 0.4, repel = TRUE, raster=FALSE, raster.dpi=c(2000, 2000), cols=c( "#197EC0CC","#1A999399", "#C8081399", "#F39B7FFF"),  pt.size = 0.01) + ggtitle("9_healthy_37329_cells; main cell types; wnn")
+p17 <-  DimPlot(Merge_obj, reduction = "umap.intgd_atac_h4_rna_h4_d2_40_1_40_k30_wnn", group.by = "percentage_chr21_peaks_quantile_merged", label = FALSE, label.size = 4.5,alpha = 0.4, repel = TRUE, raster=FALSE, raster.dpi=c(2000, 2000), cols=my_colors,  pt.size = 0.01) + ggtitle("9_healthy_11_AML_2AMS_132445_cells")
+p18 <-  DimPlot(Merge_obj, reduction = "umap.intgd_atac_h4_rna_h4_d2_40_1_40_k30_wnn", group.by = "percentage_chr15_peaks_quantile_merged", label = FALSE, label.size = 4.5,alpha = 0.4, repel = TRUE, raster=FALSE, raster.dpi=c(2000, 2000), cols=my_colors,  pt.size = 0.01) + ggtitle("9_healthy_11_AML_2AMS_132445_cells")
+
+
+pdf_file <- file.path(figures_dir, "04_uMAP_atac_h4_rna_h4_d2_40_1_40_k30_22.pdf")
+combined_plot <- p1 + p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9 + p10 + p11 +p12 + p13 +p14 + p15 + p16 + p17 + p18 
+ggsave(pdf_file, plot = combined_plot, width = 45, height = 30)
+
+
+ 
+```
+
+# subsetting Progenitors
+
+```{r Progenitors, fig.width=10}
+clustering_result <- readRDS(file.path(output_dir, "04_clustering_result_h4_rna_h4_d2_40_1_40_k30_v0_all_cells_regress_cc_138877cells.rds"))
+identical(colnames(Merge_obj), rownames(clustering_result)) #TRUE
+Merge_obj$wsnn_intgd_atac_h4_rna_h4_d2_40_1_40_k30_res.0.001 <- clustering_result$res.0.001
+table(Merge_obj$wsnn_intgd_atac_h4_rna_h4_d2_40_1_40_k30_res.0.001) 
+#      0      1      2      3 
+# 138870      3      2      2 
+
+merg_obj_prog <- subset(
+  x = Merge_obj, 
+    wsnn_intgd_atac_h4_rna_h4_d2_40_1_40_k30_res.0.001 == "0" 
+)
+
+Merge_obj$wsnn_intgd_atac_h4_rna_h4_d2_40_1_40_k30_res.0.015 <- clustering_result$res.0.015
+merg_obj_prog <- subset(
+  x = Merge_obj, 
+    wsnn_intgd_atac_h4_rna_h4_d2_40_1_40_k30_res.0.015 == "0" |
+    wsnn_intgd_atac_h4_rna_h4_d2_40_1_40_k30_res.0.015 == "2"
+)
+
+```
+
+# subclustering progenitor on original graph
+
+```{r subclustering, fig.width=30, fig.height=5}
+
+resolutions <- unique(c(0.001, 0.0025 ,seq(0.005, 0.1, 0.01), seq(0.1, 1.5, 0.2), seq(2, 3, 0.5)))
+
+# Extract the graph from the Seurat object
+graph <- merg_obj_prog[["wsnn_intgd_atac_h4_rna_h4_d2_40_1_40_k30"]]
+
+# Defining the clustering function
+ClusterParallel <- function(graph, resolution) {
+  clusters <- Seurat:::FindClusters.default(
+    object = graph, 
+    algorithm = 1, 
+    verbose = TRUE, 
+    random.seed = 0, 
+    resolution = resolution,  
+    n.iter = 10
+  )
+  return(clusters)
+}
+
+
+
+# Perform parallel clustering across different resolutions
+clustering_list <- mclapply(
+  resolutions, 
+  function(res) ClusterParallel(graph, resolution = res), 
+  mc.cores = detectCores() - 5, 
+  mc.preschedule = FALSE
+)
+
+clustering_result <- do.call(cbind, clustering_list)
+saveRDS(clustering_result, file.path(output_dir, "04_clustering_result_h4_rna_h4_d2_40_1_40_k30_regress_cc_77079_Progenitor_Mono_only_subsetting_Graph.rds"))
+
+
+clustering_result <- readRDS(file.path(output_dir, "04_clustering_result_h4_rna_h4_d2_40_1_40_k30_regress_cc_77079_Progenitor_Mono_only_subsetting_Graph.rds"))
+
+  clustree_plot <- clustree(clustering_result, prefix = "res.", node_alpha = 0.5) +
+    scale_color_manual(values = my_colors) +
+    guides(color = guide_legend(ncol = 2)) +
+    ggtitle("22 samples Progenitor_Mono wsnn_intgd_atac_h4_rna_h4_d2_40_1_40_k30_regress_cc_77,077 cells")
+
+pdf_file <- file.path(figures_dir, "04_Clustree_h4_rna_h4_d2_40_1_40_k30_v0_all_cells_regress_cc_77077ells_Progenitor_Mono_only_subsetting_Graph.pdf")
+pdf(pdf_file, width = 18, height = 30)
+print(clustree_plot)
+dev.off()
+
+
+
+
+```
+# Rebuilding the graph wnn
+```{r WNN}
+dim(merg_obj_prog) #33893 77079
+merg_obj_prog <- FindMultiModalNeighbors(
+      object = merg_obj_prog, knn.graph.name = "wknn_intgd_atac_h4_rna_h4_d2_45_1_45_k100_prog",
+  snn.graph.name = "wsnn_intgd_atac_h4_rna_h4_d2_45_1_45_k100_prog",
+  weighted.nn.name = "weighted.nn_intgd_atac_h4_rna_h4_d2_45_1_45_k100_prog",
+  reduction.list = list("harmony_ATAC_seurat4", "harmony_RNA_seurat4"),
+dims.list = list(2:45, 1:45), k.nn = 100, verbose = TRUE, modality.weight.name= list("weight_harmony_ATAC_seurat4_d2_45_1_45_k100_prog", "weight_integrated.harmony4_d2_45_1_45_k100_prog")
+    )
+merg_obj_prog <- RunUMAP(merg_obj_prog, nn.name = "weighted.nn_intgd_atac_h4_rna_h4_d2_45_1_45_k100_prog", reduction.name = 'umap.Prog_atac_h4_rna_h4_d2_45_1_45_k100_wnn', reduction.key = 'Prog_atac_h4_rna_h4_d2_45_1_45_k100_wnnUMAP_')
+saveRDS(merg_obj_prog@reductions, file.path(output_dir, "04_reductions_atac_h4_rna_h4_d2_45_1_45_k100_v0_all_cells_regress_cc_prog.rds"))
+saveRDS(merg_obj_prog@graphs, file.path(output_dir, "04_graphs_atac_h4_rna_h4_d2_45_1_45_k100_all_cells_regress_cc_prog.rds"))
+graphs <- readRDS(file.path(output_dir, "04_graphs_atac_h4_rna_h4_d2_45_1_45_k100_all_cells_regress_cc_prog.rds"))
+merg_obj_prog@graphs <- graphs
+reductions <-  readRDS(file.path(output_dir, "04_reductions_atac_h4_rna_h4_d2_45_1_45_k100_v0_all_cells_regress_cc_prog.rds"))
+merg_obj_prog@reductions <- reductions
+```
+
+
+# clustering progenitors WNN
+
+                 @
+                / \
+               /   \
+              *     #
+             / \     / \
+            +   =   %   &
+
+```{r clustering, fig.width=30, fig.height=5}
+resolutions <- unique(c(0.001,0.007, 0.010, 0.0025 ,seq(0.005, 0.1, 0.01), seq(0.1, 1.5, 0.2), seq(2, 3, 0.5)))
+graph <- merg_obj_prog[["wsnn_intgd_atac_h4_rna_h4_d2_45_1_45_k100_prog"]]
+# Define the clustering function
+ClusterParallel <- function(graph, resolution) {
+  clusters <- Seurat:::FindClusters.default(
+    object = graph, 
+    algorithm = 1, 
+    verbose = TRUE, 
+    random.seed = 0, 
+    resolution = resolution,  
+    n.iter = 10
+  )
+  return(clusters)
+}
+
+# Perform parallel clustering across different resolutions
+clustering_list <- mclapply(
+  resolutions, 
+  function(res) ClusterParallel(graph, resolution = res), 
+  mc.cores = detectCores() - 5, 
+  mc.preschedule = FALSE
+)
+
+clustering_result <- do.call(cbind, clustering_list)
+# saveRDS(clustering_result, file.path(output_dir, "04_clustering_result_h4_rna_h4_d2_45_1_45_k100_regress_cc_77079_Progenitor_Mono.rds"))
+clustering_result <- readRDS(file.path(output_dir, "04_clustering_result_h4_rna_h4_d2_45_1_45_k100_regress_cc_77079_Progenitor_Mono.rds"))
+
+clustree_plot <- clustree(clustering_result, prefix = "res.", node_alpha = 0.5) +
+    scale_color_manual(values = my_colors) +
+    guides(color = guide_legend(ncol = 2)) +
+    ggtitle("22 samples Progenitor_Mono wsnn_intgd_atac_h4_rna_h4_d2_45_1_45_k100_regress_cc_77,077 cells")
+
+pdf_file <- file.path(figures_dir, "04_Clustree_h4_h4_rna_h4_d2_45_1_45_k100_regress_cc_77077ells_Progenitor_Mono_new_graph.pdf")
+pdf(pdf_file, width = 18, height = 30)
+print(clustree_plot)
+dev.off()
+
+```
+
+
+
+# Pheatmap progenitors
+
+```{r Pheatmap }
+colGEX <- c(  "#ccc05299", "#9d183299" ,"#00A087FF"  )
+clustering_result <- readRDS(file.path(output_dir, "04_clustering_result_h4_rna_h4_d2_45_1_45_k100_regress_cc_77079_Progenitor_Mono.rds"))
+
+resolutions <- c("res.0.015","res.0.035", "res.0.065",  "res.0.3", "res.0.5")
+for (res in resolutions){
+
+pdf_file <- file.path(figures_dir, paste0("04_Composition_plot_atac_h4_rna_h4_d2_45_1_45_k100_22_" ,res, "_Progenitors.pdf"))
+pdf(pdf_file, width = 20, height = 10)
+                                                                              
+Composition_Data_cell_type <- as.matrix(prop.table(table(clustering_result[[res]], merg_obj_prog@meta.data$donor),  margin = 2))
+pheatmap(Composition_Data_cell_type, color = colGEX,
+                 cluster_rows = FALSE, cutree_cols = 2,
+                 display_numbers = TRUE,  angle_col = 315,
+                 width = 8, height = 15, main= paste0("clustering_result_h4_rna_h4_d2_45_1_45_k100__77079_cells " ,res, " \n donor") , fontsize=10 , fontsize_number =  15, number_format="%.2f", cluster_cols = FALSE, number_color = "black") 
+
+                                                                              
+Composition_Data_cell_type <- as.matrix(prop.table(table(clustering_result[[res]], merg_obj_prog@meta.data$health_condition),  margin = 2))
+pheatmap(Composition_Data_cell_type, color = colGEX,
+                 cluster_rows = FALSE, cutree_cols = 2,
+                 display_numbers = TRUE,  angle_col = 315,
+                 width = 8, height = 15, main= paste0("clustering_result_h4_rna_h4_d2_45_1_45_k100_77079_cells " ,res, " \n health_condition
+                                                      ") , fontsize=10 , fontsize_number =  5, number_format="%.2f", cluster_cols = FALSE, number_color = "black") 
+  
+Composition_Data_cell_type <- as.matrix(prop.table(table(clustering_result[[res]], merg_obj_prog@meta.data$Monosomy_cutoff),  margin = 2))
+pheatmap(Composition_Data_cell_type, color = colGEX,
+                 cluster_rows = FALSE, cutree_cols = 2,
+                 display_numbers = TRUE,  angle_col = 315,
+                 width = 8, height = 15, main= paste0("clustering_result_h4_rna_h4_d2_45_1_45_k100_77079_cells " ,res, " \n Monosomy_cutoff
+                                                      ") , fontsize=10 , fontsize_number =  5, number_format="%.2f", cluster_cols = FALSE, number_color = "black") 
+    
+Composition_Data_cell_type <- as.matrix(prop.table(table(clustering_result_20[[res]], merg_obj_prog_20@meta.data$cell_type_Rachel_v3_20),  margin = 2))
+pheatmap(Composition_Data_cell_type, color = colGEX,
+                 cluster_rows = FALSE, cutree_cols = 2,
+                 display_numbers = TRUE,  angle_col = 315,
+                 width = 8, height = 15, main= paste0("clustering_result_h4_rna_h4_d2_45_1_45_k100_77079_cells " ,res, " \n cell_type_Rachel_v3_20
+                                                      ") , fontsize=10 , fontsize_number =  5, number_format="%.2f", cluster_cols = FALSE, number_color = "black") 
+
+Composition_Data_cell_type <- as.matrix(prop.table(table(clustering_result[[res]], merg_obj_prog@meta.data$donor_main_clusters),  margin = 2))
+pheatmap(Composition_Data_cell_type, color = colGEX,
+                 cluster_rows = FALSE, cutree_cols = 2,
+                 display_numbers = TRUE,  angle_col = 315,
+                 width = 8, height = 15, main= paste0("clustering_result_h4_rna_h4_d2_45_1_45_k100_77079_cells " ,res, " \n cluster_5_main_per_sample
+                                                      ") , fontsize=10 , fontsize_number =  5, number_format="%.2f", cluster_cols = FALSE, number_color = "black") 
+
+
+dev.off()
+}
+
+######################### Transpose
+
+for (res in resolutions){
+
+
+pdf_file <- file.path(figures_dir, "04_Composition_plot_atac_h4_rna_h4_d2_45_1_45_k100_22_" ,res, "_Progenitors_transpose.pdf")
+pdf(pdf_file, width = 15, height = 7)
+
+Composition_Data_cell_type <- as.matrix(prop.table(table(merg_obj_prog@meta.data$donor, clustering_result[[res]]),  margin = 2))
+pheatmap(Composition_Data_cell_type, color = colGEX,
+                 cluster_rows = FALSE, cutree_cols = 2,
+                 display_numbers = TRUE,  angle_col = 315,
+                 width = 8, height = 15, main= paste0("clustering_result_h4_rna_h4_d2_45_1_45_k100_77079_cells " ,res, " \n donor") , fontsize=10 , fontsize_number =  15, number_format="%.2f", cluster_cols = FALSE, number_color = "black") 
+
+Composition_Data_cell_type <- as.matrix(prop.table(table( merg_obj_prog@meta.data$health_condition ,clustering_result[[res]]),  margin = 2))
+pheatmap(Composition_Data_cell_type, color = colGEX,
+                 cluster_rows = FALSE, cutree_cols = 2,
+                 display_numbers = TRUE,  angle_col = 315,
+                 width = 8, height = 15, main= paste0("clustering_result_h4_rna_h4_d2_45_1_45_k100_77079_cells " ,res, " \n health_condition
+                                                      ") , fontsize=10 , fontsize_number =  20, number_format="%.2f", cluster_cols = FALSE, number_color = "black") 
+
+Composition_Data_cell_type <- as.matrix(prop.table(table( merg_obj_prog@meta.data$Monosomy_cutoff,clustering_result[[res]]),  margin = 2))
+pheatmap(Composition_Data_cell_type, color = colGEX,
+                 cluster_rows = FALSE, cutree_cols = 2,
+                 display_numbers = TRUE,  angle_col = 315,
+                 width = 8, height = 15, main= paste0("clustering_result_h4_rna_h4_d2_45_1_45_k100_77079_cells " ,res, " \n Monosomy_cutoff
+                                                      ") , fontsize=10 , fontsize_number =  20, number_format="%.2f", cluster_cols = FALSE, number_color = "black") 
+
+Composition_Data_cell_type <- as.matrix(prop.table(table( merg_obj_prog_20@meta.data$cell_type_Rachel_v3_20,clustering_result_20[[res]]),  margin = 2))
+pheatmap(Composition_Data_cell_type, color = colGEX,
+                 cluster_rows = FALSE, cutree_cols = 2,
+                 display_numbers = TRUE,  angle_col = 315,
+                 width = 8, height = 15, main= paste0("clustering_result_h4_rna_h4_d2_45_1_45_k100_77079_cells " ,res, " \n cell_type_Rachel_v3_20
+                                                      ") , fontsize=10 , fontsize_number =  20, number_format="%.2f", cluster_cols = FALSE, number_color = "black") 
+
+Composition_Data_cell_type <- as.matrix(prop.table(table( merg_obj_prog@meta.data$donor_main_clusters,clustering_result[[res]]),  margin = 2))
+pheatmap(Composition_Data_cell_type, color = colGEX,
+                 cluster_rows = FALSE, cutree_cols = 2,
+                 display_numbers = TRUE,  angle_col = 315,
+                 width = 8, height = 15, main= paste0("clustering_result_h4_rna_h4_d2_45_1_45_k100_77079_cells " ,res, " \n cluster_5_main_per_sample
+                                                      ") , fontsize=10 , fontsize_number =  20, number_format="%.2f", cluster_cols = FALSE, number_color = "black") 
+
+
+dev.off()
+}
+
+```
+# Annotation of Progenitors
+```{r annotation prog}
+clustering_result <- readRDS(file.path(output_dir, "04_clustering_result_h4_rna_h4_d2_45_1_45_k100_regress_cc_77079_Progenitor_Mono.rds"))
+
+#Rachel final annotations
+clustering_result$cell_type_wsnn_prog_atac_h4_rna_h4_d2_45_1_45_k100_res.0.5_prog_Mono_by_Rachel<- 
+  ifelse(clustering_result$res.0.5 == "0", "CD14_Mono_Mono_like", 
+  ifelse(clustering_result$res.0.5 == "1", "Progenitor_like",
+  ifelse(clustering_result$res.0.5 == "2", "Progenitor_like",
+  ifelse(clustering_result$res.0.5 == "3", "Erythroid",
+  ifelse(clustering_result$res.0.5 == "4", "Progenitor_like",
+  ifelse(clustering_result$res.0.5 == "5", "Pro_mono_like",
+  ifelse(clustering_result$res.0.5 == "6", "CMP_like",
+  ifelse(clustering_result$res.0.5 == "7", "cDC_like ",
+  ifelse(clustering_result$res.0.5 == "8", "GMP_like",
+  ifelse(clustering_result$res.0.5 == "9", "LMPP",
+  ifelse(clustering_result$res.0.5 == "10", "HSC_like",
+  ifelse(clustering_result$res.0.5 == "11", "CD14_Mono_Mono_like",
+  ifelse(clustering_result$res.0.5 == "12", "Progenitor_like", 
+  ifelse(clustering_result$res.0.5 == "13", "CLP",
+  ifelse(clustering_result$res.0.5 == "14", "pDC_like",
+                      ifelse(clustering_result$res.0.5 == "15", "CD16_Mono_Mono_like",
+                               ifelse(clustering_result$res.0.5 == "16", "Progenitor_like",
+                                        ifelse(clustering_result$res.0.5 == "17", "Erythroid",
+                                                 ifelse(clustering_result$res.0.5 == "18", "MEP_like",
+                                                          ifelse(clustering_result$res.0.5 == "19", "CD14_Mono_Mono_like",
+                                                                   ifelse(clustering_result$res.0.5 == "20", "Progenitor_like",
+                                                                          NA)))))))))))))))))))))
+
+
+
+identical(rownames(clustering_result), (colnames(merg_obj_prog)))#TRUE
+
+merg_obj_prog$cell_type_wsnn_atac_h4_rna_h4_d2_45_1_45_k100_res.0.5_prog_Mono_by_Rachel <- clustering_result$cell_type_wsnn_prog_atac_h4_rna_h4_d2_45_1_45_k100_res.0.5_prog_Mono_by_Rachel
+saveRDS(merg_obj_prog@meta.data, file.path(output_dir, "04_meta_data_merged_object_Progenitors_Monocytes_11AML_9healthy_2AMS_with_merged_meta_data_after_qc_filtered_features_ch7_removed_clustered_annotated.rds")) 
+saveRDS(merg_obj_prog, file.path(output_dir, "04_merged_object_Progenitors_Monocytes_11AML_9healthy_2AMS_with_merged_meta_data_after_qc_filtered_features_ch7_removed_clustered_annotated.rds")) 
+
+
+merg_obj_prog<-  readRDS(file.path(output_dir, "04_merged_object_Progenitors_Monocytes_11AML_9healthy_2AMS_with_merged_meta_data_after_qc_filtered_features_ch7_removed_clustered_annotated.rds"))
+dim(merg_obj_prog) #33893 77079
+merg_obj<-  readRDS(file.path(output_dir, "03_merged_object_11AML_9healthy_2AMS_with_merged_meta_data_after_qc_all_features_included_v2.rds"))
+dim(merg_obj)
+
+
+filtered_barcodes <- colnames(merg_obj_prog)
+length(filtered_barcodes) #77079
+
+Idents(merg_obj) <- colnames(merg_obj)
+
+
+#subsetting
+merg_obj_prog_ch7 <- subset(
+  x = merg_obj,
+  idents = filtered_barcodes
+)
+dim(merg_obj_prog_ch7) #184466  77079
+identical(rownames(merg_obj_prog_ch7@meta.data ), rownames(merg_obj_prog@meta.data))
+merg_obj_prog_ch7@meta.data <- merg_obj_prog@meta.data
+
+saveRDS(merg_obj_prog_ch7, file.path(output_dir, "04_merged_object_Progenitors_Monocytes_11AML_9healthy_2AMS_with_merged_meta_data_after_qc_filtered_features_ch7_removed_clustered_annotated_all_features_v2.rds")) ###final
+```
+
+
+
+
+
+
+
+
+

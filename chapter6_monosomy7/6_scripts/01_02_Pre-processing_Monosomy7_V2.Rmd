@@ -1,0 +1,742 @@
+---
+title: "01_02_Pre-processing_Monosomy7"
+author: "Reza Ghamsari"
+date: "2024-08-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+all_times <- list()  # store the time for each chunk
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now)
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  time_it = TRUE
+)
+```
+
+# Configuration
+```{r config}
+project_root <- here::here()
+data_dir <- file.path(project_root, "data")
+output_dir <- file.path(project_root, "outputs")
+figures_dir <- file.path(project_root, "figures")
+
+# Create directories if they don't exist
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(figures_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Description
+
+Objective:
+The primary goal of this project is to curate a concise atlas comprising eleven AML (Acute Myeloid Leukemia) samples, while integrating data from nine healthy Bone Marrow Mononuclear Cells (BMMCs) obtained from publicly available sources. Additionally, this report details the inclusion of 11 individuals diagnosed with AML, some of whom present known abnormalities on chromosome 7 at the screening stage, with particular emphasis on five cases exhibiting monosomy 7.
+I merged all the 38 samples in python and then subsample only 20 samples for this project 
+
+Note: I later received two additional samples from Amsterdam and will add them to 38 samples.
+
+
+
+# Colors 
+```{r colors}
+
+my_colors <-c("#9d183299","#00A087FF", "#525ecc99","#E9967A", "#4DBBD5FF",  "#003C67FF", "#386cb0", "#7E6148FF",  "#ADB6B6FF", "#52a7cc99", "#F0E685FF",
+              "#cc52c099",  "#6acc5299","#DC143C", "#802268FF" ,"#ffbb78", "#3C548899", "#189b3699", "#cc9b5299", "#1f0fdf99", "#ccebc5", "#42857599",
+              "#868686FF", "#006400", "#0A47FFFF" , "#3B1B53FF",  "#749B58FF" ,"#ccc05299", "#cc765299" , "#1B1919FF", "#00D68FFF" ,"#14FFB1FF","#3C5488FF" ,
+              "#8F7700FF" , "#164194FF" , "#0094CDFF" , "#FFDAB9", "#FF00FF","#00FFFF","green" , "blue",  "#480607")
+
+```
+
+
+# Loading Packages
+```{r pkgs}
+script_title <- "01_Pre-processing_Monosomy7_v2"
+
+# Required packages
+required_packages <- c(
+  "Seurat", "Signac", "ggplot2", "scCustomize", "gridExtra", 
+  "parallel", "clustree", "RColorBrewer", "patchwork", 
+  "tibble", "tidyr", "dplyr", "tidyverse", "forcats", 
+  "Matrix", "EnsDb.Hsapiens.v86", "org.Hs.eg.db", 
+  "AnnotationDbi", "biomaRt", "scDblFinder", "harmony", 
+  "pheatmap", "cowplot", "gtools"
+)
+
+# Loading packages
+invisible(lapply(required_packages, library, character.only = TRUE))
+sink(file.path(figures_dir,paste0(script_title ,"_sessionInfo.txt")))
+sessionInfo()
+sink()
+```
+
+
+# Loading GEX data
+```{r GEX data}
+# Path to the directory 
+path_to_AML <- "/path/to/AML/cellranger-arc_outputs/count_outputs/"
+path_to_BMMC <- "/path/to/BMMC_luecken/cellranger-arc_outputs/count_outputs/"
+path_to_AMS <- "/path/to/AML/New_patients_Amsterdam/"
+# Define the base directories (11 AML and 9 healthy)
+base_dirs <- c(rep(path_to_AML, 25),
+               rep(path_to_BMMC, 13),
+               rep(path_to_AMS, 2))
+
+# Getting the list of all directories within the given directory (samples' name)
+list_of_AML_samples <- list.dirs(path_to_AML, recursive = FALSE, full.names = FALSE)
+list_of_BMMC_samples <- list.dirs(path_to_BMMC, recursive = FALSE, full.names = FALSE)
+list_of_AMS_samples <- c("6279DN", "6905DN")
+
+# Ordering the directories
+list_of_AML_samples <- list_of_AML_samples[mixedorder(list_of_AML_samples)]
+
+
+sample_ids <- c(list_of_AML_samples, list_of_BMMC_samples, list_of_AMS_samples)
+print(sample_ids)
+length(sample_ids) #40
+# Creating a vector with numbers 1 through 40
+AML_samples_numbers <- seq(1, 25)
+Healthy_sample_numbers <- seq(26, 38)
+AMS_samples_numbers <- c(39, 40)
+Barcode_suffix <- c(AML_samples_numbers, Healthy_sample_numbers, AMS_samples_numbers)
+sample_ids <- sample_ids[c(AML_samples_numbers, Healthy_sample_numbers, AMS_samples_numbers)]
+
+
+
+filtered_count_list <- list() 
+raw_count_list <- list()
+
+
+for (i in seq_along(sample_ids)) {
+  sample_id <- sample_ids[i]
+  base_dir <- base_dirs[i]
+    # file path based on sample_id
+  file_path <- if (sample_id %in% c("6279DN", "6905DN")) {
+    paste0(base_dir, sample_id, "/")
+  } else {
+    paste0(base_dir, sample_id, "/outs/")
+  }
+  print(file_path)
+  print(paste0("Reading sample: ", sample_id))
+  # Reading the data
+  filter_counts <- Read10X_h5(paste0(file_path, "/filtered_feature_bc_matrix.h5"))
+  filter_counts <- filter_counts$`Gene Expression`
+  raw_counts <- Read10X(paste0(file_path, "/raw_feature_bc_matrix"))
+  raw_counts <- raw_counts$`Gene Expression`
+  # Add Seurat object to list
+  filtered_count_list[[sample_id]] <- filter_counts
+  raw_count_list[[sample_id]] <- raw_counts
+}
+seurat_list <- list() 
+for (id in names(filtered_count_list)) {
+  rna_counts <- filtered_count_list[[id]]
+ seurat_obj <- CreateSeuratObject(counts = rna_counts)
+ seurat_obj$sample_id <- id
+   seurat_list[[id]] <- seurat_obj
+}
+
+for (i in seq_along(Barcode_suffix)) {
+  suffix <- Barcode_suffix[[i]]
+  print(suffix)
+  seurat_list[[i]]$barcode_suffix <- suffix
+}
+```
+
+# Preprocessing
+First round of preprocessing and clustering for ambient RNA detection.
+
+```{r clustering}
+normalize_and_reduce <- function(seurat_obj) {
+  DefaultAssay(seurat_obj) <- "RNA"
+  seurat_obj <- SCTransform(seurat_obj, verbose = FALSE, vst.flavor = "v2", 
+                           variable.features.n = 3000, new.assay.name = "SCT_supx") 
+  seurat_obj <- RunPCA(seurat_obj, reduction.name = 'pca_sct_supx', assay = "SCT_supx")
+  seurat_obj <- FindNeighbors(seurat_obj, reduction = 'pca_sct_supx', dims = 1:50, 
+                             graph.name = 'graph_sct_supx')
+  return(seurat_obj)
+}
+
+seurat_list <- mclapply(seurat_list, normalize_and_reduce, mc.cores = detectCores() - 5, mc.preschedule = FALSE)
+
+```
+# Clustering 
+
+```{r Clustering}
+resolutions <- unique(c(0.001, 0.0025, 0.015, 0.045, seq(0.005, 0.1, 0.01), seq(0.1, 1.5, 0.2), seq(2, 3, 0.5)))
+# Analysis functions
+cluster_parallel <- function(seurat_obj, graph_name, resolutions) {
+  graph <- seurat_obj[[graph_name]]
+  clusters <- Seurat:::FindClusters.default(
+    object = graph, 
+    algorithm = 1, 
+    verbose = FALSE, 
+    random.seed = 0, 
+    resolution = resolutions, 
+    n.iter = 10
+  )
+  return(clusters)
+}
+clustering_list <- mclapply(seurat_list, cluster_parallel, graph_name = "graph_sct_supx", resolutions = resolutions, mc.cores = detectCores() - 5, mc.preschedule = FALSE)
+
+```
+## Clustree Visualisation
+```{r clustree, fig.width=20}
+ClustreeParallel <- function(x, name) {
+  plot <- clustree(x, prefix = "res.", node_label_size = 4, node_text_size = 5, 
+                   node_alpha = 0.3, scale_node_text = FALSE, 
+                   node_size_range = c(4, 20)) +
+    scale_color_manual(values = my_colors) +
+    guides(color = guide_legend(ncol = 2)) +
+    ggtitle(paste("Clustree", name))
+  
+  return(plot)
+}
+
+page_plots <- mclapply(seq_along(clustering_list), function(i) {
+  ClustreeParallel(clustering_list[[i]], names(clustering_list)[i])
+}, mc.cores = detectCores() - 5, mc.preschedule = FALSE)
+
+names(page_plots) <- names(clustering_list)
+pdf(file = file.path(figures_dir, "01_Clustree_RNA_pre_soupx_louvain_40_samples.pdf"), width = 30, height = 25,  pointsize = 5) 
+
+for (plot in page_plots) {
+  print(plot)
+}
+
+dev.off()
+
+```
+
+## Cluster annotation
+based on best stability in clustree visualization, I chose the best resolution for each sample.
+```{r}
+# Manually assigning clustering values to seurat_list for each sample
+seurat_list$Sample_1$cluster_soupx <- clustering_list$Sample_1$res.0.5
+seurat_list$Sample_2$cluster_soupx <- clustering_list$Sample_2$res.0.9
+seurat_list$Sample_3$cluster_soupx <- clustering_list$Sample_3$res.0.9
+seurat_list$Sample_4$cluster_soupx <- clustering_list$Sample_4$res.0.9
+seurat_list$Sample_5$cluster_soupx <- clustering_list$Sample_5$res.0.5
+seurat_list$Sample_6$cluster_soupx <- clustering_list$Sample_6$res.2
+seurat_list$Sample_7$cluster_soupx <- clustering_list$Sample_7$res.0.9
+seurat_list$Sample_8$cluster_soupx <- clustering_list$Sample_8$res.0.9
+seurat_list$Sample_9$cluster_soupx <- clustering_list$Sample_9$res.0.9
+seurat_list$Sample_10$cluster_soupx <- clustering_list$Sample_10$res.0.5
+seurat_list$Sample_11$cluster_soupx <- clustering_list$Sample_11$res.0.9
+seurat_list$Sample_12$cluster_soupx <- clustering_list$Sample_12$res.0.7
+seurat_list$Sample_13$cluster_soupx <- clustering_list$Sample_13$res.0.7
+seurat_list$Sample_14$cluster_soupx <- clustering_list$Sample_14$res.0.7
+seurat_list$Sample_15$cluster_soupx <- clustering_list$Sample_15$res.0.9
+seurat_list$Sample_16$cluster_soupx <- clustering_list$Sample_16$res.0.9
+seurat_list$Sample_17$cluster_soupx <- clustering_list$Sample_17$res.0.7
+seurat_list$Sample_18$cluster_soupx <- clustering_list$Sample_18$res.0.9
+seurat_list$Sample_19$cluster_soupx <- clustering_list$Sample_19$res.0.7
+seurat_list$Sample_20$cluster_soupx <- clustering_list$Sample_20$res.0.5
+seurat_list$Sample_21$cluster_soupx <- clustering_list$Sample_21$res.1.3
+seurat_list$Sample_22$cluster_soupx <- clustering_list$Sample_22$res.0.9
+seurat_list$Sample_23$cluster_soupx <- clustering_list$Sample_23$res.0.9
+seurat_list$Sample_24$cluster_soupx <- clustering_list$Sample_24$res.1.3
+seurat_list$Sample_25$cluster_soupx <- clustering_list$Sample_25$res.1.3
+seurat_list$BMMC_S1_D1$cluster_soupx <- clustering_list$BMMC_S1_D1$res.0.5
+seurat_list$BMMC_S1_D2$cluster_soupx <- clustering_list$BMMC_S1_D2$res.1.3
+seurat_list$BMMC_S1_D3$cluster_soupx <- clustering_list$BMMC_S1_D3$res.0.7
+seurat_list$BMMC_S2_D1$cluster_soupx <- clustering_list$BMMC_S2_D1$res.1.1
+seurat_list$BMMC_S2_D4$cluster_soupx <- clustering_list$BMMC_S2_D4$res.1.1
+seurat_list$BMMC_S2_D5$cluster_soupx <- clustering_list$BMMC_S2_D5$res.2
+seurat_list$BMMC_S3_D10$cluster_soupx <- clustering_list$BMMC_S3_D10$res.0.5
+seurat_list$BMMC_S3_D3$cluster_soupx <- clustering_list$BMMC_S3_D3$res.0.9
+seurat_list$BMMC_S3_D6$cluster_soupx <- clustering_list$BMMC_S3_D6$res.0.9
+seurat_list$BMMC_S3_D7$cluster_soupx <- clustering_list$BMMC_S3_D7$res.1.3
+seurat_list$BMMC_S4_D1$cluster_soupx <- clustering_list$BMMC_S4_D1$res.0.5
+seurat_list$BMMC_S4_D8$cluster_soupx <- clustering_list$BMMC_S4_D8$res.1.3
+seurat_list$BMMC_S4_D9$cluster_soupx <- clustering_list$BMMC_S4_D9$res.1.3
+seurat_list$`6279DN`$cluster_soupx <- clustering_list$`6279DN`$res.0.9
+seurat_list$`6905DN`$cluster_soupx <- clustering_list$`6905DN`$res.0.3 #!when resolution was higher for this sample I was getteing this error:"Error in adjustCounts(sc, roundToInt = TRUE): Contamination fractions must have already been calculated/set." and calculated rho was 0.
+```
+
+# Soupx 
+```{r soupX , fig.width=20}
+# A list to store SoupChannel objects
+soupx_list <- list()
+for (Obj_name in names(seurat_list)) {
+  print(paste0(" Processing Sample:  ",Obj_name ))
+  filter_counts <- filtered_count_list[[Obj_name]] 
+  # Read the data
+  raw_counts <- raw_count_list[[Obj_name]]
+  sc <- SoupChannel(raw_counts,filter_counts)
+  sc <- setClusters(sc,seurat_list[[Obj_name]]@meta.data$cluster_soupx)
+  sc <- autoEstCont(sc, doPlot=FALSE)
+  out <- adjustCounts(sc, roundToInt = TRUE)
+  soupx_list[[Obj_name]] <- out  # Add to list with sample id as name
+}
+saveRDS(soupx_list, file.path(output_dir, "01_soupx_list_RNA_corrected_26_Samples.rds"))
+```
+## Saving the percentage of each samples' ambient RNA in a csv file
+```{r ambient_summary, fig.width=20}
+results <- data.frame()
+for (obj in names(seurat_list)) {
+  DefaultAssay(seurat_list[[obj]]) <- "RNA"
+  if (identical(colnames(soupx_list[[obj]]), colnames(filtered_count_list[[obj]])) &
+      identical(rownames(soupx_list[[obj]]), rownames(filtered_count_list[[obj]]))) {
+    Total_Count_RNA <- sum(filtered_count_list[[obj]])
+    Count_Ambient_RNA <- Total_Count_RNA - (sum(soupx_list[[obj]]))
+    Total_Count_Corrected <- sum(soupx_list[[obj]])
+    ambient_percentage <- (1 - (sum(soupx_list[[obj]]/sum(filtered_count_list[[obj]]))))*100
+    ambient_percentage <- round(ambient_percentage, 1)
+    print(paste0("ambient RNA percentage for:", obj, "= ", ambient_percentage))
+    result_row <- data.frame(Sample = obj, Total_Count_RNA = Total_Count_RNA ,  nCount_Ambient_RNA = Count_Ambient_RNA, nCount_corrected =Total_Count_RNA- Count_Ambient_RNA, Percentage_ambient = ambient_percentage )
+    results <- rbind(results, result_row)
+  }
+}
+
+write.csv(results, file = file.path(figures_dir, "1-Ambient_RNA_percentage.csv"), row.names = FALSE)
+
+results_long <- results %>%
+  pivot_longer(cols = c(nCount_corrected, nCount_Ambient_RNA), 
+               names_to = "RNA_Type", 
+               values_to = "Count")
+
+# stacked bar plot
+plot <- ggplot(results_long, aes(x = Sample, y = Count, fill = RNA_Type)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Ambient RNA Count per Sample \n SoupX", x = "Sample", y = "RNA Count") +
+  scale_fill_manual(values = c("nCount_corrected" = "steelblue", "nCount_Ambient_RNA" = "firebrick")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Reorder by Total_Count_RNA from high to low
+results$Sample <- fct_reorder(results$Sample, results$Total_Count_RNA, .desc = TRUE)
+
+results_long <- results %>%
+  pivot_longer(cols = c(nCount_corrected, nCount_Ambient_RNA), 
+               names_to = "RNA_Type", 
+               values_to = "Count")
+
+
+plot2 <- ggplot(results_long, aes(x = Sample, y = Count, fill = RNA_Type)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Ambient RNA Count per Sample \n SoupX", x = "Sample", y = "RNA Count") +
+  scale_fill_manual(values = c("nCount_corrected" = "steelblue", "nCount_Ambient_RNA" = "firebrick")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+pdf(file = file.path(figures_dir, "01_Ambient_RNA_stacked_bar_plot.pdf"), width = 30, height = 25, pointsize = 5)
+print(plot)
+print(plot2)
+dev.off()
+
+```
+
+# Converting soupx mtx to seurat object
+1- creating Seurat objects.
+2- creating donor column
+3- creating sample_id column
+4-  Updating barcode suffixes from 1 to 1-40
+5- merging all soupx seurat
+6- changing all rownames to $barcodes
+7- opening and adding the atac object
+
+
+```{r soupx_seurat_list}
+soupx_list <- readRDS(file.path(output_dir, "01_soupx_list_RNA_corrected_26_Samples.rds"))
+sample_number <- seq(1, 40)
+
+# Creating a list to store corrected Seurat objects
+soupx_seurat_list <- list()
+
+for (sample_id in names(soupx_list)) {
+  soupcount <- soupx_list[[sample_id]]
+  seurat_obj <- CreateSeuratObject(counts = soupcount)
+  seurat_obj$donor <- sample_id
+  soupx_seurat_list[[sample_id]] <- seurat_obj
+}
+
+for (obj in names(seurat_list)){
+  if (identical(colnames(soupx_seurat_list[[obj]]), colnames(seurat_list[[obj]]))){
+    print("Identical")
+  }}
+
+
+for (obj in names(seurat_list)){
+  if (identical(rownames(soupx_seurat_list[[obj]]), rownames(seurat_list[[obj]]))){
+    print("Identical")
+  }}
+
+
+#***********************************************************************
+# changing all barcodes  from to 1-38
+for (i in seq_along(soupx_seurat_list)) {
+  numb <- sample_number[[i]]
+  soupx_seurat_list[[i]]$barcode <- sub("1$", numb, colnames(soupx_seurat_list[[i]]))
+}
+
+for (id in names(soupx_seurat_list)) {
+  colnames(soupx_seurat_list[[id]]) <- soupx_seurat_list[[id]]$barcode
+}
+
+all_rownames <- lapply(soupx_seurat_list, rownames)
+are_identical <- length(unique(all_rownames)) == 1 #TRUE
+packageVersion("scCustomize") # ‘2.1.2’
+packageVersion("Seurat") #‘4.4.0’
+
+Seurat_merge_soupx <- base::merge(x=soupx_seurat_list[[1]], y=soupx_seurat_list[2:length(soupx_seurat_list)], add.cell.ids = NULL,  project = "AML_Monosomy")
+# An object of class Seurat 
+# 36601 features across 350414 samples within 1 assay 
+# Active assay: RNA (36601 features, 0 variable features)
+#  2 layers present: counts, data
+
+saveRDS(Seurat_merge_soupx, file.path(output_dir, "01_Merge_40sample_snRNA_after_soupx.rds"))
+
+```
+
+# Reading ATAC data
+
+This data originally generated with cellranger arc -aggr (so all the atac data have same peak coordination) from 38 multiome samples, however due to the large size  of the file, it was opened in python and then 11 patients in the screening and 9 healthy donor was sub-sampled  as a .mtx format. 
+for the RNA we can open it and directly convert it to a seurat object, however for the atac, we need to first convert it to a chromatin assay object.
+for the RNA part as I wanted to remove ambient rna sample wise, I got data from cellranger-arc count output directly and did not use from aggr output.
+after removing all ambient RNAs I merged all samples then I integrate them with ATAC from Aggr output in the next chunk.
+
+
+```{r ATAC data}
+# output of sub-sampling of atac data in python saved in atac_dir dir.
+
+atac_dir_20   <- file.path(data_dir, "aggr_outputs/subset_screening/")
+frag_file_20  <- file.path(data_dir, "aggr_outputs/atac_fragments.tsv.gz")
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86) 
+seqlevelsStyle(annotations) <- 'UCSC'
+genome(annotations) <- "hg38"
+#*********************************************************************** 11 AML and 13 Healthy
+atac_counts_20 <- Seurat::Read10X(atac_dir_20) #184466 x 203847 sparse Matrix of class "dgCMatrix
+dim(atac_counts_20) #184466 x 203847 sparse Matrix of class "dgCMatrix
+grange_counts_20 <- StringToGRanges(rownames(atac_counts_20), sep = c(":", "-"))
+grange_use_20 <- seqnames(grange_counts_20) %in% standardChromosomes(grange_counts_20)
+atac_counts_20 <- atac_counts_20[as.vector(grange_use_20), ] #184466 x 232173 sparse Matrix of class "dgCMatrix"
+
+  # Create Chromatin Assay
+chrom_assay_20 <- CreateChromatinAssay(
+    counts = atac_counts_20,
+    sep = c(":", "-"),
+    genome = 'hg38',
+    fragments = frag_file_20,
+    min.cells = 0,# because I wanted to have same number of feature as AMS samples I changed this one to 0
+    annotation = annotations
+  )
+  
+Sobj_ATAC_20 <- CreateSeuratObject(
+  counts = chrom_assay_20,
+  assay = "ATAC"
+)
+      
+Sobj_ATAC_20@meta.data$barcode <- colnames(Sobj_ATAC_20)
+Sobj_ATAC_20@meta.data <- Sobj_ATAC_20@meta.data %>%
+  mutate(sample_id = gsub(".*-", "", barcode))
+dim(Sobj_ATAC_20) #184466 features for 149064 cells
+
+#*********************************************************************** AMS samples
+atac_dir_2_AMS <- file.path(data_dir, "AMS/filtered_feature_bc_matrix/")
+atac_counts_AMS <- Seurat::Read10X(atac_dir_2_AMS)
+atac_counts_AMS <- atac_counts_AMS$Peaks
+dim(atac_counts_AMS) #184466  36179
+grange_counts_AMS <- StringToGRanges(rownames(atac_counts_AMS), sep = c(":", "-"))
+grange_use_AMS <- seqnames(grange_counts_AMS) %in% standardChromosomes(grange_counts_AMS)
+atac_counts_AMS <- atac_counts_AMS[as.vector(grange_use_AMS), ] 
+dim(atac_counts_AMS) #184466  36179
+
+# Read fragments
+frag_file_AMS <- file.path(data_dir, "AMS/atac_fragments.tsv.gz")
+  # Create Chromatin Assay
+  chrom_assay_AMS <- CreateChromatinAssay(
+    counts = atac_counts_AMS,
+    sep = c(":", "-"),
+    genome = 'hg38',
+    fragments = frag_file_AMS,
+    min.cells = 0,  # because I wanted to have same number of feature as AML_20 samples I changed this one to 0
+    annotation = annotations
+  )
+  
+Sobj_ATAC_AMS <- CreateSeuratObject(
+  counts = chrom_assay_AMS,
+  assay = "ATAC"
+)
+      
+Sobj_ATAC_AMS@meta.data$barcode <- colnames(Sobj_ATAC_AMS)
+Sobj_ATAC_AMS@meta.data <- Sobj_ATAC_AMS@meta.data %>%
+  mutate(sample_id = gsub(".*-", "", barcode))
+dim(Sobj_ATAC_AMS) #184540  36179
+AML_list<- SplitObject(Sobj_ATAC_20, split.by = "sample_id")
+AMS_list<- SplitObject(Sobj_ATAC_AMS, split.by = "sample_id")
+
+```
+
+# Merging
+
+```{r Merging}
+# Path to the directory 
+path_to_AML <- "/path/to/AML/samples/cellranger-arc_outputs/count_outputs/"
+path_to_BMMC <- "/path/to/AML/samples/BMMC_luecken/cellranger-arc_outputs/count_outputs/"
+path_to_AMS <- "/path/to/AML/samples/RaCHseq_AML/New_patients_Amsterdam/"
+# Defining the base directories (11 AML and 9 healthy)
+base_dirs <- c(rep(path_to_AML, 25),
+               rep(path_to_BMMC, 13),
+               rep(path_to_AMS, 2))
+
+list_of_AML_samples <- list.dirs(path_to_AML, recursive = FALSE, full.names = FALSE)
+list_of_BMMC_samples <- list.dirs(path_to_BMMC, recursive = FALSE, full.names = FALSE)
+list_of_AMS_samples <- c("6279DN", "6905DN")
+
+list_of_AML_samples <- list_of_AML_samples[mixedorder(list_of_AML_samples)]  # Ordering the directories
+
+donors <- c(list_of_AML_samples, list_of_BMMC_samples, list_of_AMS_samples)
+AML11_healthy_9_AMS2_sample_id = c(1, 3, 5, 7, 10, 13, 16, 18, 20, 22, 24, 26, 27, 28, 29, 34, 35, 36, 37, 38, 39, 40)
+donor <- donors[AML11_healthy_9_AMS2_sample_id]
+barcode_mapping <- donors
+names(barcode_mapping) <- c(1:40)
+
+Sobj_ATAC_20@meta.data <- Sobj_ATAC_20@meta.data %>%
+  mutate(donor = ifelse(sample_id %in% names(barcode_mapping), barcode_mapping[sample_id], NA))
+table(Sobj_ATAC_20$donor)
+
+# Sobj_ATAC_AMS manipulate the meta.data to add/update the site column
+AMS_barcode_mapping <- donors[39:40]
+names(AMS_barcode_mapping) <- c(1:2)
+Sobj_ATAC_AMS@meta.data <- Sobj_ATAC_AMS@meta.data %>%
+  mutate(donor = ifelse(sample_id %in% names(AMS_barcode_mapping), AMS_barcode_mapping[sample_id], NA))
+
+AML_list<- SplitObject(Sobj_ATAC_20, split.by = "donor")
+AMS_list<- SplitObject(Sobj_ATAC_AMS, split.by = "donor")
+ATAC_merge_list <- c(AML_list,AMS_list)
+
+```
+
+# Adding Sample Annotations 
+```{r annotations}
+Seurat_merge_soupx <- readRDS(file.path(output_dir, "01_Merge_40sample_snRNA_after_soupx.rds"))
+Seurat_merge_soupx@meta.data <- Seurat_merge_soupx@meta.data %>%
+  mutate(sample_id = gsub(".*-", "", barcode))
+
+
+barcode_mapping_rna <- donors
+names(barcode_mapping_rna) <- c(1:40)
+Seurat_merge_soupx@meta.data <- Seurat_merge_soupx@meta.data %>%
+  mutate(donor = ifelse(sample_id %in% names(barcode_mapping_rna), barcode_mapping_rna[sample_id], NA))
+table(Seurat_merge_soupx$donor)
+
+
+# 6279DN     6905DN BMMC_S1_D1 BMMC_S1_D2 BMMC_S1_D3 BMMC_S2_D1 BMMC_S3_D6 BMMC_S3_D7 BMMC_S4_D1 BMMC_S4_D8 BMMC_S4_D9   Sample_1  Sample_10 
+#      16286      19893       8442       8341       5626       6319       2355       2740      16337      16934       8217       5529      11314 
+#  Sample_13  Sample_16  Sample_18  Sample_20  Sample_22  Sample_24   Sample_3   Sample_5   Sample_7 
+#       8619       4376       2176      10231       9463       2122       8864       7947       3112 
+
+
+AML_all <-  donors[c(1:25, 39,40)]
+Healthy <- setdiff(donors, AML_all)
+# Defining the lists of samples
+AML_monosomy <-  c("Sample_3", "Sample_4", "Sample_7", "Sample_8","Sample_9","Sample_10", "Sample_11","Sample_12","Sample_18", "Sample_19", "Sample_22", "Sample_23")
+AML_non_monosomy <- c("Sample_1", "Sample_2", "Sample_5", "Sample_6", "Sample_13","Sample_14","Sample_15", "Sample_16","Sample_17", "Sample_20","Sample_21", "Sample_24", "Sample_25", "6279DN", "6905DN")
+
+
+male_donors <-  c("Sample_1", "Sample_2", "Sample_3","Sample_4", "Sample_7","Sample_8","Sample_9", "Sample_16","Sample_17", "Sample_18","Sample_19", "Sample_22","Sample_23", "BMMC_S1_D1", "BMMC_S2_D1","BMMC_S4_D1" , "BMMC_S4_D8")
+
+female_donors <-  c( "Sample_5","Sample_6", "Sample_10","Sample_11","Sample_12", "Sample_13","Sample_14","Sample_15", "Sample_24", "Sample_25")
+
+
+site_mapping <- c(Sample_1="PAH006", Sample_2="PAH006", Sample_3="ALF011", Sample_4="ALF011",
+                  Sample_5="ALF025", Sample_6="ALF025", Sample_7="ALF042", Sample_8="ALF042",
+                  Sample_9="ALF042", Sample_10="MMN051", Sample_11="MMN051", Sample_12="MMN051",
+                  Sample_13="PMC084", Sample_14="PMC084", Sample_15="PMC084", Sample_16="ALF052",
+                  Sample_17="ALF052", Sample_18="ALF057", Sample_19="ALF057", Sample_20="FSH071",
+                  Sample_21="FSH071", Sample_22="MMN073", Sample_23="MMN073", Sample_24="PMC098",
+                  Sample_25="PMC098", BMMC_S1_D1="Site_2", BMMC_S2_D1="Site_2", BMMC_S4_D1="Site_4", BMMC_S4_D8="Site_4", '6279DN'="AMD", '6905DN'="AMD")
+
+Seurat_merge_soupx@meta.data <- Seurat_merge_soupx@meta.data %>%
+  mutate(site = ifelse(donor %in% names(site_mapping), site_mapping[donor], NA))
+
+time_point_mapping <- c(Sample_1="Screening", Sample_2="Relapse", Sample_3="Screening", Sample_4="EOC2",
+                        Sample_5="Screening", Sample_6="EOC1", Sample_7="Screening", Sample_8="C1D28",
+                        Sample_9="EOC2", Sample_10="Screening", Sample_11="C2D28", Sample_12="Relapse",
+                        Sample_13="Screening", Sample_14="C1D28", Sample_15="C4", Sample_16="Screening",
+                        Sample_17="Refractory", Sample_18="Screening", Sample_19="Refractory",
+                        Sample_20="Screening", Sample_21="Refractory", Sample_22="Screening",
+                        Sample_23="Refractory", Sample_24="Screening", Sample_25="C2D28", BMMC_S1_D1="healthy", BMMC_S2_D1="healthy", BMMC_S4_D1="healthy", BMMC_S4_D8="healthy", '6279DN'="Screening", '6905DN'="Screening")
+
+
+Seurat_merge_soupx@meta.data <- Seurat_merge_soupx@meta.data %>%
+  mutate(time_point = ifelse(donor %in% names(time_point_mapping), time_point_mapping[donor], NA))
+
+unique(Seurat_merge_soupx@meta.data$time_point)
+treatment_mapping <- c(Sample_1="VEN + LDAC + Prac", Sample_2="VEN + LDAC + Prac", Sample_3="VEN + LDAC + Prac",
+                       Sample_4="VEN + LDAC + Prac", Sample_5="VEN + LDAC + Prac", Sample_6="VEN + LDAC + Prac",
+                       Sample_7="VEN + LDAC + Prac", Sample_8="VEN + LDAC + Prac", Sample_9="VEN + LDAC + Prac",
+                       Sample_10="VEN + LDAC + Prac", Sample_11="VEN + LDAC + Prac", Sample_12="VEN + LDAC + Prac",
+                       Sample_13="VEN + LDAC + Prac", Sample_14="VEN + LDAC + Prac", Sample_15="VEN + LDAC + Prac",
+                       Sample_16="VEN + LDAC", Sample_17="VEN + LDAC", Sample_18="VEN + LDAC",
+                       Sample_19="VEN + LDAC", Sample_20="VEN + LDAC", Sample_21="VEN + LDAC",
+                       Sample_22="VEN + LDAC", Sample_23="VEN + LDAC", Sample_24="VEN + LDAC",
+                       Sample_25="VEN + LDAC", BMMC_S1_D1="healthy", BMMC_S2_D1="healthy", BMMC_S4_D1="healthy", BMMC_S4_D8="healthy",'6279DN'="AMD", '6905DN'="AMD"  )
+
+Seurat_merge_soupx@meta.data <- Seurat_merge_soupx@meta.data %>%
+  mutate(Treatment = ifelse(donor %in% names(treatment_mapping), treatment_mapping[donor], NA))
+unique(Seurat_merge_soupx@meta.data$Treatment)
+viability_mapping <- c(Sample_1="85", Sample_2="58", Sample_3="95", Sample_4="67",
+                       Sample_5="80", Sample_6="78", Sample_7="66", Sample_8="94",
+                       Sample_9="93", Sample_10="33", Sample_11="61", Sample_12="63",
+                       Sample_13="100", Sample_14="95", Sample_15="63", Sample_16="46",
+                       Sample_17="82", Sample_18="68", Sample_19="59", Sample_20="97",
+                       Sample_21="98", Sample_22="84", Sample_23="71", Sample_24="88",
+                       Sample_25="94", BMMC_S1_D1=NA, BMMC_S2_D1=NA, BMMC_S4_D1=NA, BMMC_S4_D8=NA, '6279DN'="AMD", '6905DN'="AMD")
+
+
+Seurat_merge_soupx@meta.data <- Seurat_merge_soupx@meta.data %>%
+  mutate(Viability_Percentage = ifelse(donor %in% names(viability_mapping), viability_mapping[donor], NA))
+
+unique(Seurat_merge_soupx@meta.data$Viability_Percentage)
+Blast_mapping <- c(Sample_1="36", Sample_2="14", Sample_3="72", Sample_4="3.5",
+                       Sample_5="64", Sample_6="2", Sample_7="67", Sample_8="94",
+                       Sample_9="21", Sample_10="53", Sample_11="2", Sample_12=NA,
+                       Sample_13="80", Sample_14=NA, Sample_15="6.2", Sample_16="51",
+                       Sample_17=NA, Sample_18="38", Sample_19=NA, Sample_20=NA,
+                       Sample_21=NA, Sample_22="60", Sample_23=NA, Sample_24="72",
+                       Sample_25="1", BMMC_S1_D1=NA, BMMC_S2_D1=NA, BMMC_S4_D1=NA, BMMC_S4_D8=NA, '6279DN'="AMD", '6905DN'="AMD")
+
+Seurat_merge_soupx@meta.data <- Seurat_merge_soupx@meta.data %>%
+  mutate(Blast_Percentage = ifelse(donor %in% names(Blast_mapping), Blast_mapping[donor], NA))
+
+unique(Seurat_merge_soupx@meta.data$Blast_Percentage)
+# a function to categorize the blast percentages
+categorize_blast <- function(blast_value) {
+  if (is.na(blast_value)) {
+    return(NA)
+  } else if (blast_value > 60) {
+    return("above_60%")
+  } else if (blast_value >= 30) {
+    return("30%_60%")
+  } else {
+    return("under_30%")
+  }
+}
+
+blast_mapping <- sapply(Blast_mapping, categorize_blast)
+
+Seurat_merge_soupx@meta.data$blast_level <- blast_mapping[Seurat_merge_soupx@meta.data$donor]
+
+
+table(Seurat_merge_soupx@meta.data$blast_level, Seurat_merge_soupx@meta.data$donor)
+
+
+
+
+Seurat_merge_soupx$health_condition <- ifelse(
+  Seurat_merge_soupx$donor %in% AML_monosomy ,
+  "AML_monosomy",
+  ifelse(
+    Seurat_merge_soupx$donor %in% AML_non_monosomy,
+    "AML_non_monosomy",
+    "healthy_donors"
+  )
+)
+
+
+Seurat_merge_soupx$gender <- ifelse(
+  Seurat_merge_soupx$donor %in% male_donors ,
+  "male",
+  ifelse(
+    Seurat_merge_soupx$donor %in% female_donors,
+    "female",
+    "Not_provided"
+  )
+)
+
+
+# Adding the cytogenetic diagnosis information
+cytogenetics_dx <- c(PAH006 = "Complex with abn 3q, t(11;15)",
+                     ALF011 = "Monosomy 7",
+                     ALF025 = "del7q + NPM1",
+                     ALF042 = "Monosomy 7, t(1;3;13)(p34;q21;q22)",
+                     MMN051 = "Monosomy 7",
+                     PMC084 = "CMK, no del17p",
+                     ALF052 = "t(2;9) complex with high hyperdiploidy",
+                     ALF057 = "monosomy 7, add 12p, idic 21",
+                     FSH071 = "inv(3)",
+                     MMN073 = "inv(3) and monosomy 7",
+                     PMC098 = "No mitosis")
+Seurat_merge_soupx@meta.data$Cytogenetics_Dx <- cytogenetics_dx[Seurat_merge_soupx@meta.data$site]
+table(Seurat_merge_soupx@meta.data$Cytogenetics_Dx, Seurat_merge_soupx@meta.data$site)
+#***********************************************************************
+# Adding the genomics status information
+genomics_status <- c(
+  PAH006 = "MLL rearrangement",
+  ALF011 = "DNMT3A E469Yfs*2, RUNX1 R201Q, SRSF2 P95L, TET2 A362Lfs*10",
+  ALF025 = "DNMT3A R882P, IDH1 R132H, NPM1 W288Cfs*12",
+  ALF042 = "CBL C416Y, DNMT3A R771*, DNMT3A N717I, EZH2 N263Qfs*8, TET2 Q232R, CEBPA",
+  MMN051 = "DNMT3A R882H, NRAS G12D, BCOR R810*, EZH2 G155E, TET2 R1262P, TET2 S1586*, CEPBA",
+  PMC084 = "RUNX1 R162S, CEBPA H236RFS*78, CUX1 Q252H, TET2 S1480Ffs*9, PHF6",
+  ALF052 = "TET2 H1904R, STAG2 R216*",
+  ALF057 = "NRAS G13D, RUNX1 166*",
+  FSH071 = "BCOR Y755*, GATA2 N297S, IKZF1 R213*, NRAS G13R, NRAS G12S, SF3B1 K700E, WT1 A387VFS*4, PPM1D",
+  MMN073 = "ASXL1 G646WFS*12, ZRSR2 W111*, ZRSR2 Q103*, NRAS GQ61R, NRAS G12D, RUNX1 W106S",
+  PMC098 = "BCOR, DNMT3A, IDH1, KDM6A"
+)
+Seurat_merge_soupx@meta.data$genomics_status <- genomics_status[Seurat_merge_soupx@meta.data$site]
+table(Seurat_merge_soupx@meta.data$genomics_status, Seurat_merge_soupx@meta.data$site)
+
+#***********************************************************************
+# Adding the list of mutations
+mutations <- c("RUNX1", "TET2", "IDH1", "DNMT3A", "EZH2", "CEBPA", "NRAS", "BCOR")
+
+for (mutation in mutations) {
+  column_name <- paste0(mutation, "_mutation")
+  print(column_name)
+  Seurat_merge_soupx@meta.data[[column_name]] <- ifelse(grepl(mutation, Seurat_merge_soupx@meta.data$genomics_status), "positive", "negative")}
+
+
+
+#***********************************************************************
+table(Seurat_merge_soupx@meta.data$health_condition, Seurat_merge_soupx@meta.data$donor)
+  #              6279DN 6905DN BMMC_S1_D1 BMMC_S1_D2 BMMC_S1_D3 BMMC_S2_D1 BMMC_S3_D6 BMMC_S3_D7 BMMC_S4_D1 BMMC_S4_D8 BMMC_S4_D9 Sample_1 Sample_10 Sample_13 Sample_16
+  # AML_monosomy          0      0          0          0          0          0          0          0          0          0          0        0     11314         0         0
+  # AML_non_monosomy  16286  19893          0          0          0          0          0          0          0          0          0     5529         0      8619      4376
+  # healthy_donors        0      0       8442       8341       5626       6319       2355       2740      16337      16934       8217        0         0         0         0
+  #                 
+  #                  Sample_18 Sample_20 Sample_22 Sample_24 Sample_3 Sample_5 Sample_7
+  # AML_monosomy          2176         0      9463         0     8864        0     3112
+  # AML_non_monosomy         0     10231         0      2122        0     7947        0
+  # healthy_donors           0         0         0         0        0        0        0
+
+#***********************************************************************
+AML11_healthy_9_AMS_2_subset <- subset(Seurat_merge_soupx, subset = donor %in% names(ATAC_merge_list))
+RNA_list <- SplitObject(AML11_healthy_9_AMS_2_subset, split.by = "donor")
+
+```
+
+
+# merging atac and RNA
+
+```{r bimodal}
+colnames(RNA_list$'6279DN')<- gsub("-39", "-1", colnames(RNA_list$'6279DN'))
+RNA_list$'6279DN'$barcode <- colnames(RNA_list$'6279DN')
+colnames(RNA_list$'6905DN')<- gsub("-40", "-2", colnames(RNA_list$'6905DN'))
+RNA_list$'6905DN'$barcode <- colnames(RNA_list$'6905DN')
+
+multiome_list <- list()
+for (donor in names(ATAC_merge_list)){
+  print(paste0("processing:" , donor))
+  RNA_obj <- RNA_list[[donor]]
+  ATAC_obj <- ATAC_merge_list [[donor]]
+  print(identical(RNA_obj@meta.data$donor, ATAC_obj@meta.data$donor))
+  print(identical(RNA_obj@meta.data$barcode, ATAC_obj@meta.data$barcode))
+  RNA_obj@assays[["ATAC"]] <- ATAC_obj@assays[["ATAC"]]
+  RNA_obj$nCount_ATAC <- ATAC_obj$nCount_ATAC
+  RNA_obj$nFeature_ATAC <- ATAC_obj$nFeature_ATAC
+  multiome_list[[donor]] <- RNA_obj
+}
+
+saveRDS(multiome_list, file.path(output_dir, "01_02_merged_multiome_11AML_9_healthy_2AMS_before_doublet_and_qc_not_merged_v1.rds"))
+
+```
