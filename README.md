@@ -56,7 +56,6 @@ Comparative analysis of matched single-nucleus and single-cell RNA sequencing da
 ---
 
 ### Chapter 3 — Integrative Single-Cell Multiome Profiling of AML: A Longitudinal Reference Mini-Atlas
-> Manuscript in preparation
 
 Construction of the first single-cell multiome (paired snRNA-seq + snATAC-seq) reference atlas of AML bone marrow, spanning 29 libraries from 11 AML patients across diverse cytogenetic subtypes and longitudinal disease stages, integrated with 10 healthy donor datasets.
 
@@ -65,7 +64,7 @@ Construction of the first single-cell multiome (paired snRNA-seq + snATAC-seq) r
 ---
 
 ### Chapter 4 — Dissecting Intra-Tumour Heterogeneity across Cytogenetic Groups of AML
-> Manuscript in preparation
+> Preprint / Submitted manuscript
 
 Application of the multimodal atlas to characterise the cellular and regulatory consequences of monosomy 7 at single-cell resolution, including monosomy 7 clone tracking, and lineage-resolved transcriptional and chromatin accessibility analysis.
 
