@@ -67,7 +67,7 @@ Construction of the first single-cell multiome (paired snRNA-seq + snATAC-seq) r
 ### Chapter 4 — Dissecting Intra-Tumour Heterogeneity across Cytogenetic Groups of AML
 > Manuscript in preparation
 
-Application of the multimodal atlas to characterise the cellular and regulatory consequences of monosomy 7 at single-cell resolution, including copy number inference from ATAC-seq, longitudinal clone tracking, and lineage-resolved transcriptional and chromatin accessibility analysis.
+Application of the multimodal atlas to characterise the cellular and regulatory consequences of monosomy 7 at single-cell resolution, including monosomy 7 clone tracking, and lineage-resolved transcriptional and chromatin accessibility analysis.
 
 📁 Scripts: `chapter6_monosomy7/scripts/`
 
@@ -85,17 +85,6 @@ Application of the multimodal atlas to characterise the cellular and regulatory 
 
 ## Software and Dependencies
 
-Analysis was performed using the following main tools and packages:
-
-| Tool | Version | Use |
-|------|---------|-----|
-| R | 4.x | Primary analysis language |
-| Seurat | 5.x | scRNA-seq analysis and integration |
-| Signac | 1.x | scATAC-seq analysis |
-| Cell Ranger | 7.x | Read alignment and quantification |
-| Python | 3.x | Supporting analyses |
-| Scanpy | 1.x | Single-cell analysis |
-
 Full session information is provided in each chapter's script folder.
 
 ---
@@ -103,15 +92,6 @@ Full session information is provided in each chapter's script folder.
 ## How to Use
 
 Scripts within each chapter folder are numbered in order of execution:
-
-```bash
-01_preprocessing.R       # Raw data processing and QC
-02_integration.R         # Batch correction and integration
-03_clustering.R          # Dimensionality reduction and clustering
-04_annotation.R          # Cell type annotation
-05_analysis.R            # Downstream biological analyses
-06_figures.R             # Figure generation
-```
 
 ---
 
